@@ -1,0 +1,3568 @@
+---
+title: "Predicting NFL Team Records — 2025 Season"
+subtitle: "Chicago Bears Football Analytics Interview Project"
+author: "Asar"
+date: today
+format:
+  html:
+    theme: flatly
+    toc: true
+    toc-depth: 3
+    toc-title: "Contents"
+    toc-location: left
+    code-fold: true
+    code-tools: true
+    code-summary: "Show code"
+    fig-width: 9
+    fig-height: 5
+    fig-align: center
+    smooth-scroll: true
+    embed-resources: true
+execute:
+  echo: true
+  warning: false
+  message: false
+---
+
+```{python}
+#| label: setup
+#| code-summary: "Imports & configuration"
+
+import pandas as pd
+import numpy as np
+import plotly.graph_objects as go
+from plotly.subplots import make_subplots
+import warnings
+warnings.filterwarnings("ignore")
+
+# ── File paths ────────────────────────────────────────────────────────────────
+DATA_DIR = "data/raw"
+PATH_PBP      = DATA_DIR + "/pbp_game_stats.csv"
+PATH_WTS      = DATA_DIR + "/weekly_team_stats.csv"
+PATH_SCH      = DATA_DIR + "/schedules.csv"
+PATH_ADV_PASS = DATA_DIR + "/adv_passing.csv"
+PATH_ADV_RUSH = DATA_DIR + "/adv_rushing.csv"
+PATH_ADV_DEF  = DATA_DIR + "/adv_defense.csv"
+
+OTC_DIR = "data/over_the_cap"
+PATH_OTC_SPENDING  = OTC_DIR + "/otc_positional_spending.csv"
+PATH_OTC_CONTRACTS = OTC_DIR + "/otc_player_contracts.csv"
+# Note: OTC data is used only in the post-model supplementary analysis (Part VII).
+# It is not used in any model training, feature engineering, or prediction.
+
+# ── Colour palette ────────────────────────────────────────────────────────────
+BLUE   = "#2563EB"
+RED    = "#DC2626"
+TEAL   = "#0D9488"
+AMBER  = "#D97706"
+SLATE  = "#94A3B8"
+BORDER = "#E2E8F0"
+BEARS  = "#0B162A"
+GREEN  = "#16A34A"
+PURPLE = "#7C3AED"
+
+def clean_fig(fig, height=420, margin=None):
+    if margin is None:
+        margin = dict(l=48, r=24, t=32, b=48)
+    fig.update_layout(
+        height=height, margin=margin,
+        paper_bgcolor="white", plot_bgcolor="white",
+        font=dict(family="Inter, system-ui, sans-serif", size=13, color="#1E293B"),
+        showlegend=False,
+    )
+    fig.update_xaxes(showgrid=False, zeroline=False, linecolor=BORDER,
+                     tickcolor=BORDER, tickfont_color=SLATE)
+    fig.update_yaxes(showgrid=True, gridcolor=BORDER, zeroline=False,
+                     linecolor=BORDER, tickfont_color=SLATE)
+    return fig
+```
+
+---
+
+# Part I — Exploratory Data Analysis
+
+## 1. Data loading & cleaning
+
+All data comes from Pro Football Reference via nflverse. The analysis covers
+**2018–2025 regular seasons** — 2018 is the earliest year PFR publishes advanced
+tracking stats (pressure rates, yards after contact, coverage metrics), so using
+data prior to that would mean running the model on an incomplete feature set.
+
+
+```{python}
+#| label: data-load
+#| code-summary: "Load and clean raw files"
+
+pbp      = pd.read_csv(PATH_PBP)
+wts      = pd.read_csv(PATH_WTS)
+sch      = pd.read_csv(PATH_SCH)
+adv_pass = pd.read_csv(PATH_ADV_PASS)
+adv_rush = pd.read_csv(PATH_ADV_RUSH)
+adv_def  = pd.read_csv(PATH_ADV_DEF)
+
+# ── Clean weekly_team_stats
+wts = wts[wts["recent_team"] != wts["opponent_team"]].copy()
+wts["season_type"] = wts["season_type"].str[:3]
+wts = wts[wts["season_type"] == "REG"].copy()
+wts = wts.rename(columns={"recent_team": "team", "opponent_team": "opponent"})
+
+print(f"pbp:      {len(pbp):>6,} rows | seasons {pbp['season'].min()}–{pbp['season'].max()}")
+print(f"wts:      {len(wts):>6,} rows | seasons {wts['season'].min()}–{wts['season'].max()}")
+print(f"sch:      {len(sch):>6,} rows | seasons {sch['season'].min()}–{sch['season'].max()}")
+print(f"adv_pass: {len(adv_pass):>6,} rows | seasons {adv_pass['season'].min()}–{adv_pass['season'].max()}")
+print(f"adv_rush: {len(adv_rush):>6,} rows | seasons {adv_rush['season'].min()}–{adv_rush['season'].max()}")
+print(f"adv_def:  {len(adv_def):>6,} rows | seasons {adv_def['season'].min()}–{adv_def['season'].max()}")
+```
+
+```{python}
+#| label: build-long
+#| code-summary: "Build 2-rows-per-game master table"
+
+def build_long_games(sch):
+    """
+    Reshape schedule from 1 row per game to 2 rows per game.
+    total_line is carried through alongside spread_line_team
+    so it is available as a vegas feature later.
+    """
+    DIVISIONS = {
+        "AFC East":  {"BUF","MIA","NE","NYJ"},
+        "AFC North": {"BAL","CIN","CLE","PIT"},
+        "AFC South": {"HOU","IND","JAX","TEN"},
+        "AFC West":  {"DEN","KC","LV","LAC"},
+        "NFC East":  {"DAL","NYG","PHI","WAS"},
+        "NFC North": {"CHI","DET","GB","MIN"},
+        "NFC South": {"ATL","CAR","NO","TB"},
+        "NFC West":  {"ARI","LAR","SEA","SF"},
+    }
+    team_div = {}
+    for div, teams in DIVISIONS.items():
+        for t in teams:
+            team_div[t] = div
+
+    home = sch.copy().rename(columns={
+        "home_team":"team", "away_team":"opponent",
+        "home_score":"team_score", "away_score":"opp_score",
+        "home_rest":"rest", "away_rest":"opp_rest"})
+    home["is_home"] = 1
+    home["spread_line_team"] = home["spread_line"]
+
+    away = sch.copy().rename(columns={
+        "away_team":"team", "home_team":"opponent",
+        "away_score":"team_score", "home_score":"opp_score",
+        "away_rest":"rest", "home_rest":"opp_rest"})
+    away["is_home"] = 0
+    away["spread_line_team"] = -away["spread_line"]
+
+    g = pd.concat([home, away], ignore_index=True)
+    g["win"] = np.where(
+        g["team_score"].notna(),
+        (g["team_score"] > g["opp_score"]).astype(float),
+        np.nan)
+    g["point_diff"] = g["team_score"] - g["opp_score"]
+    g["favoured"]   = (g["spread_line_team"] > 0).astype(int)
+
+    # net rest differential
+    g["net_rest_diff"] = g["rest"] - g["opp_rest"]
+
+    # capped point margin
+    g["point_diff_capped"] = g["point_diff"].clip(-21, 21)
+
+    # division game flag
+    g["is_division_game"] = (
+        g.apply(lambda r: int(team_div.get(r["team"],"") ==
+                               team_div.get(r["opponent"],"") and
+                               team_div.get(r["team"],"") != ""), axis=1)
+    )
+
+    return g
+
+games = build_long_games(sch)
+games = games[games["season"] >= 2018].copy()
+
+home_key = sch[["game_id","season","week","home_team","away_team"]].rename(
+    columns={"home_team":"team","away_team":"opponent"})
+away_key = sch[["game_id","season","week","home_team","away_team"]].rename(
+    columns={"away_team":"team","home_team":"opponent"})
+wts = wts.merge(pd.concat([home_key, away_key]),
+                on=["season","week","team","opponent"], how="inner")
+
+print(f"Game rows (2018-2025): {len(games):,} | unique games: {games['game_id'].nunique():,}")
+div_pct = games["is_division_game"].mean()
+print(f"Division games: {div_pct:.1%} of rows ({games['is_division_game'].sum():,} team-rows)")
+```
+
+```{python}
+#| label: assemble
+#| code-summary: "Join all sources into unified game-level stats table"
+
+def assemble_game_stats(games, wts, pbp, adv_pass, adv_rush, adv_def):
+    g = games.sort_values(["season","week","game_id","team"]).copy()
+
+    g = g.merge(pbp[["game_id","team","third_down_att","third_down_conv",
+                      "turnovers_total","fumbles_lost","interceptions",
+                      "time_of_possession_sec","first_downs_total",
+                      "penalty_count","penalty_yards"]],
+                on=["game_id","team"], how="left")
+
+    opp_def = adv_def[["game_id","team","def_targets","def_completions_allowed",
+                        "def_yards_allowed","def_receiving_td_allowed","def_ints"]].rename(
+        columns={"team":"opponent", "def_targets":"pass_att_recon",
+                 "def_completions_allowed":"completions_recon",
+                 "def_yards_allowed":"passing_yards_recon",
+                 "def_receiving_td_allowed":"passing_tds_recon",
+                 "def_ints":"ints_thrown_recon"})
+    g = g.merge(opp_def, on=["game_id","opponent"], how="left")
+
+    rush = adv_rush[["game_id","team","carries","rushing_yards_before_contact",
+                      "rushing_yards_after_contact","rushing_broken_tackles"]].copy()
+    rush["rushing_yards_recon"] = (rush["rushing_yards_before_contact"]
+                                   + rush["rushing_yards_after_contact"])
+    g = g.merge(rush, on=["game_id","team"], how="left")
+
+    g = g.merge(adv_pass[["game_id","team","passing_drops","passing_bad_throws",
+                           "times_sacked","times_hurried","times_hit","times_pressured"]],
+                on=["game_id","team"], how="left")
+
+    g = g.merge(adv_def[["game_id","team","def_targets","def_completions_allowed",
+                          "def_yards_allowed","def_receiving_td_allowed","def_ints",
+                          "def_sacks","def_pressures","def_tackles_combined",
+                          "def_missed_tackles","def_yards_after_catch"]],
+                on=["game_id","team"], how="left", suffixes=("","_def"))
+
+    g = g.merge(wts[["game_id","team","passing_yards","completions","attempts",
+                      "sacks","sack_yards","rushing_yards"]],
+                on=["game_id","team"], how="left")
+
+    g["pass_yards"] = g["passing_yards"].fillna(g["passing_yards_recon"])
+    g["pass_att"]   = g["attempts"].fillna(g["pass_att_recon"])
+    g["pass_cmp"]   = g["completions"].fillna(g["completions_recon"])
+    g["sack_count"] = g["sacks"].fillna(g["times_sacked"])
+    g["sack_yds"]   = g["sack_yards"].fillna(g["times_sacked"] * 7)
+    g["rush_yards"] = g["rushing_yards"].fillna(g["rushing_yards_recon"])
+
+    dropbacks = (g["pass_att"] + g["sack_count"]).replace(0, np.nan)
+    g["net_ypa"]         = (g["pass_yards"] - g["sack_yds"]) / dropbacks
+    g["comp_pct"]        = g["pass_cmp"] / g["pass_att"].replace(0, np.nan)
+    g["yds_per_carry"]   = g["rush_yards"] / g["carries"].replace(0, np.nan)
+    # Net yards per play — used as the ELO update signal.
+    # Formula: (net passing yards + rushing yards) / (dropbacks + carries)
+    # Net passing yards = pass_yards - sack_yds  (same as net_ypa numerator)
+    # This is deliberately net so sacks penalise the offense and reward the defense,
+    # which is consistent with how net_ypa treats pass rush in the rolling features.
+    total_plays = (dropbacks + g["carries"]).replace(0, np.nan)
+    g["yds_per_play"] = (g["pass_yards"] - g["sack_yds"] + g["rush_yards"]) / total_plays
+    g["third_down_rate"] = g["third_down_conv"] / g["third_down_att"].replace(0, np.nan)
+    g["pressure_rate"]   = g["times_pressured"] / dropbacks
+    g["bad_throw_rate"]  = g["passing_bad_throws"] / g["pass_att"].replace(0, np.nan)
+    g["drop_rate"]       = g["passing_drops"] / g["pass_att"].replace(0, np.nan)
+    g["yac_per_carry"]   = g["rushing_yards_after_contact"] / g["carries"].replace(0, np.nan)
+
+    g["def_comp_pct"]      = g["def_completions_allowed"] / g["def_targets"].replace(0, np.nan)
+    g["def_yds_per_tgt"]   = g["def_yards_allowed"] / g["def_targets"].replace(0, np.nan)
+    g["def_pressure_rate"] = g["def_pressures"] / (g["def_targets"] + g["def_sacks"]).replace(0, np.nan)
+    g["def_miss_tkl_pct"]  = g["def_missed_tackles"] / g["def_tackles_combined"].replace(0, np.nan)
+    g["def_yac_allowed"]   = g["def_yards_after_catch"] / g["def_completions_allowed"].replace(0, np.nan)
+
+    opp_to = (g[["game_id","team","turnovers_total"]].dropna()
+               .rename(columns={"team":"opponent","turnovers_total":"opp_turnovers"}))
+    g = g.merge(opp_to, on=["game_id","opponent"], how="left")
+    g["turnover_margin"] = g["opp_turnovers"] - g["turnovers_total"]
+
+    return g.reset_index(drop=True)
+
+g = assemble_game_stats(games, wts, pbp, adv_pass, adv_rush, adv_def)
+played = g[g["win"].notna() & g["season"].between(2018, 2025)].copy()
+
+print(f"Full dataset:        {len(g):,} rows")
+print(f"Played 2018-2025:    {len(played):,} rows")
+print(f"2025 played:         {g[(g['season']==2025) & g['win'].notna()]['game_id'].nunique()} games")
+```
+
+## 1b. Playoff stakes flags
+
+Week 18 games are structurally different: teams that have already clinched or
+been eliminated have no incentive to win. We compute four binary flags from
+the cumulative standings **before** each game is played.
+
+```{python}
+#| label: stakes
+#| code-summary: "Compute playoff-stakes flags from cumulative standings"
+
+def compute_stakes(g):
+    """
+    Compute pre-game playoff-clinch and elimination flags with NO leakage.
+
+    Fix vs earlier versions
+    -----------------------
+    A prior implementation built cumulative standings across all games first,
+    then assigned those final-season totals back to every game row — causing
+    look-ahead leakage: a Week 3 game would see standings that included
+    Weeks 4-18 results.
+
+    Correct approach
+    ----------------
+    Process games in strict chronological order. Before processing game G,
+    snapshot each team's current win/loss total (the true pre-game state).
+    Then update running totals AFTER snapshotting. This guarantees that the
+    flag for any game never includes that game's result or any future result.
+
+    Clinch proxy    : cumulative wins   >= 10 before this game
+    Elimination proxy: cumulative losses >= 10 before this game
+    """
+    running  = {}   # (season, team) -> {"wins": int, "losses": int}
+    pre_game = {}   # (game_id, team) -> {"wins": int, "losses": int}
+
+    # All unique games in strict chronological order
+    played_games = (
+        g[g["win"].notna()]
+        .sort_values(["season", "week", "game_id"])
+        .drop_duplicates("game_id", keep="first")[["game_id", "season", "week"]]
+    )
+
+    for _, gr in played_games.iterrows():
+        gid    = gr["game_id"]
+        season = gr["season"]
+        game_rows = g[g["game_id"] == gid][["team", "win"]].dropna(subset=["win"])
+        if len(game_rows) != 2:
+            continue
+
+        # Snapshot BEFORE updating — true pre-game state
+        for _, tr in game_rows.iterrows():
+            key = (season, tr["team"])
+            running.setdefault(key, {"wins": 0, "losses": 0})
+            pre_game[(gid, tr["team"])] = running[key].copy()
+
+        # Update running totals AFTER snapshotting
+        for _, tr in game_rows.iterrows():
+            key = (season, tr["team"])
+            if int(tr["win"]) == 1:
+                running[key]["wins"]   += 1
+            else:
+                running[key]["losses"] += 1
+
+    rows = []
+    for _, row in g.iterrows():
+        pre     = pre_game.get((row["game_id"], row["team"]),
+                               {"wins": 0, "losses": 0})
+        opp_pre = pre_game.get((row["game_id"], row["opponent"]),
+                               {"wins": 0, "losses": 0})
+        clinched   = int(pre["wins"]       >= 10)
+        eliminated = int(pre["losses"]     >= 10)
+        opp_clin   = int(opp_pre["wins"]   >= 10)
+        opp_elim   = int(opp_pre["losses"] >= 10)
+        rows.append({
+            "game_id":         row["game_id"],
+            "team":            row["team"],
+            "team_clinched":   clinched,
+            "team_eliminated": eliminated,
+            "opp_clinched":    opp_clin,
+            "opp_eliminated":  opp_elim,
+            "game_low_stakes": int(clinched or eliminated or opp_clin or opp_elim),
+        })
+    return pd.DataFrame(rows)
+
+stakes_df = compute_stakes(g)
+g = g.merge(stakes_df, on=["game_id","team"], how="left")
+for col in ["team_clinched","team_eliminated","opp_clinched","opp_eliminated","game_low_stakes"]:
+    g[col] = g[col].fillna(0).astype(int)
+
+print(f"Low-stakes game rows: {g['game_low_stakes'].sum():,}")
+```
+
+## 2. Win rate distributions
+
+```{python}
+#| label: fig-season-wins
+#| fig-cap: "Win rate by season (regular season, home and away combined)."
+
+win_by_season = (played.groupby("season")["win"].mean()
+                        .reset_index()
+                        .rename(columns={"win":"win_pct"}))
+
+fig = go.Figure()
+fig.add_trace(go.Bar(
+    x=win_by_season["season"], y=win_by_season["win_pct"],
+    marker_color=BLUE, marker_line_width=0,
+    text=(win_by_season["win_pct"]*100).round(1).astype(str)+"%",
+    textposition="outside"))
+fig.add_hline(y=0.5, line_dash="dot", line_color=SLATE, line_width=1.2)
+fig.update_layout(
+    xaxis=dict(title="Season", dtick=1, tickangle=-45),
+    yaxis=dict(title="Win rate", tickformat=".0%", range=[0.45, 0.56]))
+clean_fig(fig).show()
+```
+
+```{python}
+#| label: fig-hfa
+#| fig-cap: "Home field advantage by season. The 2020 (no fans) anomaly is visible."
+
+hfa = (played[played["is_home"]==1]
+       .groupby("season")["win"].mean()
+       .reset_index()
+       .rename(columns={"win":"home_win_pct"}))
+
+fig = go.Figure()
+fig.add_trace(go.Scatter(
+    x=hfa["season"], y=hfa["home_win_pct"], mode="lines+markers",
+    line=dict(color=BLUE, width=2.5), marker=dict(size=7, color=BLUE),
+    fill="tozeroy", fillcolor="rgba(37,99,235,0.08)",
+    hovertemplate="<b>%{x}</b>: %{y:.1%}<extra></extra>"))
+fig.add_hline(y=hfa["home_win_pct"].mean(), line_dash="dot",
+              line_color=SLATE, line_width=1.2,
+              annotation_text=f"Avg {hfa['home_win_pct'].mean():.1%}",
+              annotation_position="right", annotation_font_color=SLATE)
+fig.add_annotation(x=2020, y=hfa.loc[hfa["season"]==2020,"home_win_pct"].values[0],
+    text="No fans<br>(COVID)", showarrow=True, arrowhead=2,
+    arrowcolor=RED, font=dict(color=RED, size=11), ax=40, ay=-32)
+fig.update_layout(
+    xaxis=dict(title="Season", dtick=1, tickangle=-45),
+    yaxis=dict(title="Home team win rate", tickformat=".0%", range=[0.44, 0.64]))
+clean_fig(fig).show()
+```
+
+## 3. EDA — Key predictors
+
+### Vegas spread accuracy baseline
+
+Before building any model it is worth establishing what the betting market already
+knows. The spread favourite wins ~71% of the time across 2018–2025 regular season
+Weeks 1–17. This is the baseline the model must beat.
+
+```{python}
+#| label: fig-vegas-baseline
+#| fig-cap: "Vegas spread accuracy by season (favourite = team with positive spread_line_team)."
+
+vegas_by_season = (
+    played.assign(
+        vegas_pred=lambda df: (df["spread_line_team"] > 0).astype(int),
+        vegas_correct=lambda df: (
+            (df["spread_line_team"] > 0).astype(int) == df["win"].astype(int)
+        ).astype(int)
+    )
+    .groupby("season")["vegas_correct"]
+    .mean()
+    .reset_index()
+    .rename(columns={"vegas_correct": "acc"})
+)
+
+fig = go.Figure()
+fig.add_trace(go.Bar(
+    x=vegas_by_season["season"], y=vegas_by_season["acc"],
+    marker_color=AMBER, marker_line_width=0,
+    text=(vegas_by_season["acc"]*100).round(1).astype(str)+"%",
+    textposition="outside"))
+fig.add_hline(y=vegas_by_season["acc"].mean(), line_dash="dot",
+              line_color=SLATE, line_width=1.2,
+              annotation_text=f"Avg {vegas_by_season['acc'].mean():.1%}",
+              annotation_position="right", annotation_font_color=SLATE)
+fig.update_layout(
+    xaxis=dict(title="Season", dtick=1, tickangle=-45),
+    yaxis=dict(title="Vegas accuracy (spread)", tickformat=".0%", range=[0.6, 0.8]))
+clean_fig(fig).show()
+```
+
+### Turnover margin distribution
+
+```{python}
+#| label: fig-turnover
+#| fig-cap: "Turnover margin by outcome. Wins cluster strongly in positive margin."
+
+fig = go.Figure()
+for label, mask, color in [("Wins", played["win"]==1, BLUE),
+                             ("Losses", played["win"]==0, RED)]:
+    fig.add_trace(go.Histogram(
+        x=played[mask]["turnover_margin"].dropna(),
+        name=label, marker_color=color, opacity=0.65, nbinsx=25))
+fig.update_layout(
+    barmode="overlay",
+    xaxis_title="Turnover margin (team TOs forced − team TOs committed)",
+    yaxis_title="Count", showlegend=True,
+    legend=dict(x=0.02, y=0.98, bgcolor="rgba(255,255,255,0.8)"))
+clean_fig(fig).show()
+```
+
+### Net YPA quartile win rates
+
+```{python}
+#| label: fig-nypa-quartiles
+#| fig-cap: "Win rate by net YPA quartile. Shows monotonic relationship — higher net YPA → higher win rate."
+
+played_nona = played[played["net_ypa"].notna() & played["win"].notna()].copy()
+played_nona["nypa_q"] = pd.qcut(
+    played_nona["net_ypa"], q=4,
+    labels=["Q4 (lowest net YPA)", "Q3", "Q2", "Q1 (highest net YPA)"])
+
+nypa_wr = (played_nona.groupby("nypa_q", observed=True)["win"]
+           .mean().reset_index().rename(columns={"win":"win_rate"}))
+
+fig = go.Figure(go.Bar(
+    x=nypa_wr["nypa_q"].astype(str),
+    y=nypa_wr["win_rate"],
+    marker_color=[RED, AMBER, TEAL, BLUE],
+    marker_line_width=0,
+    text=(nypa_wr["win_rate"]*100).round(1).astype(str)+"%",
+    textposition="outside"))
+fig.add_hline(y=0.5, line_dash="dot", line_color=SLATE, line_width=1.2,
+              annotation_text="50%", annotation_font_color=SLATE)
+fig.update_layout(
+    xaxis_title="Net YPA quartile (game-level)",
+    yaxis=dict(title="Win rate", tickformat=".0%", range=[0, 0.85]))
+clean_fig(fig).show()
+```
+
+### Point differential distribution
+
+```{python}
+#| label: fig-pt-diff
+#| fig-cap: "Point differential distribution across all played games (2018–2025). Mean ≈ 0 by construction."
+
+fig = go.Figure()
+fig.add_trace(go.Histogram(
+    x=played["point_diff"].dropna(),
+    nbinsx=50, marker_color=BLUE, marker_line_width=0, opacity=0.8,
+    hovertemplate="Margin: %{x}<br>Count: %{y}<extra></extra>"))
+fig.add_vline(x=0, line_color=RED, line_dash="dot", line_width=1.5,
+              annotation_text="0", annotation_font_color=RED)
+fig.update_layout(
+    xaxis_title="Point differential (team score − opponent score)",
+    yaxis_title="Count")
+clean_fig(fig).show()
+```
+
+---
+
+# Part II — Modeling
+
+## 4. Offensive & defensive ELO system
+
+Standard team-level ELO treats offenses and defenses as a single unit. This
+implementation separates them into **offensive and defensive ELO ratings** that
+decouple unit quality. Four pre-game numbers per row —
+`team_off_elo`, `team_def_elo`, `opp_off_elo`, `opp_def_elo` — serve as model
+features.
+
+**ELO update signal: net yards per play.** The update signal is **net yards per play** (passing
+and rushing combined, net of sack yards), which captures both facets of
+offensive efficiency in a single number. An offense finishing above the
+season-to-date prior-week rolling median YPP earns an ELO "win"; below median
+earns the defense an ELO "win." The coupled structure is preserved: each game
+updates both the offensive ELO of the team and the defensive ELO of the
+opponent.
+
+**Median strategy (leakage-free):** Week 1 uses a historical fallback of
+5.5 net YPP (the approximate 2018–2024 grand median). From Week 2 onward, the
+threshold is the median of all per-week YPP medians from Weeks 1…W-1 of the
+*current* season — purely historical, never incorporating the current game's
+data.
+
+```{python}
+#| label: elo
+#| code-summary: "Compute offensive and defensive ELO ratings"
+
+def compute_elo(g, K=20, INIT=1500, REGRESS=1/3):
+    """
+    Yards-per-play ELO system.
+
+    Signal
+    ------
+    Uses net yards per play (yds_per_play) as the update signal:
+
+        yds_per_play = (net_pass_yards + rush_yards) / (dropbacks + carries)
+
+    where net_pass_yards = pass_yards - sack_yards, so sacks penalise the
+    offense. This collapses passing AND rushing efficiency into one number
+    without requiring arbitrary weighting. An offense that finishes above
+    the season-to-date prior-week rolling median YPP is a "win" for the
+    offensive ELO; below median is a "win" for the defensive ELO.
+
+    Median strategy — no leakage
+    ----------------------------
+    Week 1 : hardcoded grand-median fallback (~5.5 net YPP historically).
+             No current-season data is available yet.
+    Week W : median of the per-week YPP medians from Weeks 1 … W-1 of the
+             CURRENT season. This is a season-to-date rolling median that
+             never uses any data from Week W or later — clean pre-game info.
+
+    The fallback of 5.5 is derived from the historical 2018-2024 grand
+    median net YPP across all team-games. Update this if the dataset window
+    changes substantially.
+
+    ELO structure (unchanged)
+    -------------------------
+    Two ratings per team: off_elo (offensive efficiency) and def_elo
+    (defensive efficiency). The expected score for off_elo[t1] vs def_elo[t2]
+    follows the standard ELO formula. Season-to-season: ratings regress 1/3
+    of the way back to INIT=1500 before Week 1 of a new season.
+    """
+    off_elo = {t: INIT for t in g["team"].unique()}
+    def_elo = {t: INIT for t in g["team"].unique()}
+
+    # ── Build season-to-date prior-week rolling median YPP ───────────────────
+    # Step 1: compute the cross-game median YPP for every (season, week) pair.
+    #         This uses only games already played in that week — fine, because
+    #         the median is only USED to update ELO for future weeks.
+    played_g = (g[g["yds_per_play"].notna()]
+                .sort_values(["season", "week", "game_id"]))
+
+    wk_med_list = {}
+    for (season, week), grp in played_g.groupby(["season", "week"]):
+        wk_med_list[(season, week)] = grp["yds_per_play"].median()
+
+    # Step 2: for each (season, week), the comparison threshold is the median
+    #         of all per-week medians from Weeks 1 … W-1 in that season.
+    #         Week 1 → no prior data → use historical fallback of 5.5.
+    YPP_FALLBACK = 5.5   # approximate historical net YPP grand median
+    all_season_weeks = sorted(wk_med_list.keys())
+    weekly_med = {}
+    season_running = {}   # season -> [wk1_med, wk2_med, ...]
+    for (season, week) in all_season_weeks:
+        prev_weeks = season_running.get(season, [])
+        if prev_weeks:
+            # median of prior-week medians — purely historical, no leakage
+            weekly_med[(season, week)] = float(np.median(prev_weeks))
+        else:
+            # Week 1: no within-season data yet; use grand-median fallback
+            weekly_med[(season, week)] = YPP_FALLBACK
+        season_running.setdefault(season, []).append(wk_med_list[(season, week)])
+
+    # ── Process games in strict chronological order ───────────────────────────
+    game_order = (g.sort_values(["season", "week", "game_id"])
+                   .drop_duplicates("game_id", keep="first")
+                   [["game_id", "season", "week"]])
+
+    records = {}
+    prev_season = None
+
+    for _, gr in game_order.iterrows():
+        gid, season, week = gr["game_id"], gr["season"], gr["week"]
+
+        # Season-boundary regression: pull ratings 1/3 back toward INIT
+        if prev_season is not None and season != prev_season:
+            for t in list(off_elo):
+                off_elo[t] = off_elo[t] * (1 - REGRESS) + INIT * REGRESS
+                def_elo[t] = def_elo[t] * (1 - REGRESS) + INIT * REGRESS
+        prev_season = season
+
+        rows = g[g["game_id"] == gid]
+        teams = rows["team"].tolist()
+        if len(teams) != 2:
+            continue
+        t1, t2 = teams[0], teams[1]
+        for t in [t1, t2]:
+            off_elo.setdefault(t, INIT)
+            def_elo.setdefault(t, INIT)
+
+        # ── Snapshot PRE-GAME ratings (no leakage) ────────────────────────────
+        for t, opp in [(t1, t2), (t2, t1)]:
+            records[(gid, t)] = {
+                "game_id": gid, "team": t,
+                "team_off_elo": off_elo[t],   "team_def_elo": def_elo[t],
+                "opp_off_elo":  off_elo[opp],  "opp_def_elo":  def_elo[opp]}
+
+        # ── ELO update using yds_per_play ─────────────────────────────────────
+        ypp_vals = {row["team"]: row["yds_per_play"]
+                    for _, row in rows.iterrows()
+                    if pd.notna(row["yds_per_play"])}
+        if t1 not in ypp_vals or t2 not in ypp_vals:
+            continue
+        ypp1 = ypp_vals[t1]
+        ypp2 = ypp_vals[t2]
+        med  = weekly_med.get((season, week), YPP_FALLBACK)
+
+        # Offense t1 vs Defense t2
+        # "win" for off_t1 = t1's YPP > season-to-date median
+        # "win" for def_t2 = t1's YPP < season-to-date median (same event)
+        exp1   = 1 / (1 + 10**((def_elo[t2] - off_elo[t1]) / 400))
+        delta1 = K * ((1.0 if ypp1 > med else 0.0) - exp1)
+        off_elo[t1] += delta1
+        def_elo[t2] -= delta1   # symmetric: def gets credit when off underperforms
+
+        # Offense t2 vs Defense t1
+        exp2   = 1 / (1 + 10**((def_elo[t1] - off_elo[t2]) / 400))
+        delta2 = K * ((1.0 if ypp2 > med else 0.0) - exp2)
+        off_elo[t2] += delta2
+        def_elo[t1] -= delta2
+
+    elo_df = pd.DataFrame(records.values())
+    elo_df["off_elo_diff"]   = elo_df["team_off_elo"] - elo_df["opp_def_elo"]
+    elo_df["def_elo_diff"]   = elo_df["team_def_elo"] - elo_df["opp_off_elo"]
+    elo_df["total_elo_diff"] = elo_df["off_elo_diff"] + elo_df["def_elo_diff"]
+    return elo_df
+
+elo_df = compute_elo(g)
+print(f"Off ELO range: {elo_df['team_off_elo'].min():.0f} – {elo_df['team_off_elo'].max():.0f}")
+print(f"Def ELO range: {elo_df['team_def_elo'].min():.0f} – {elo_df['team_def_elo'].max():.0f}")
+# Sanity check: median YPP used as threshold for each season
+print("\nSeason-to-date YPP medians used as ELO thresholds (sample):")
+played_check = g[g["yds_per_play"].notna()]
+for season in sorted(played_check["season"].unique())[-3:]:
+    s = played_check[played_check["season"]==season]
+    print(f"  {season}: overall median YPP = {s['yds_per_play'].median():.2f} | "
+          f"range {s['yds_per_play'].min():.1f}–{s['yds_per_play'].max():.1f}")
+```
+
+```{python}
+#| label: fig-elo-dist
+#| fig-cap: "Total ELO differential (yards-per-play signal) separates wins from losses."
+
+em = g[["game_id","team","win"]].merge(elo_df, on=["game_id","team"])
+ep = em[em["win"].notna()].copy()
+
+fig = go.Figure()
+for label, mask, color in [("Wins", ep["win"]==1, BLUE), ("Losses", ep["win"]==0, RED)]:
+    fig.add_trace(go.Histogram(x=ep[mask]["total_elo_diff"], name=label,
+        marker_color=color, opacity=0.6, nbinsx=40))
+fig.update_layout(barmode="overlay", xaxis_title="Total ELO differential (off + def)",
+                  yaxis_title="Count", showlegend=True,
+                  legend=dict(x=0.02, y=0.98, bgcolor="rgba(255,255,255,0.8)"))
+clean_fig(fig).show()
+```
+
+```{python}
+#| label: fig-ypp-elo-threshold
+#| code-summary: "Season median YPP threshold used in ELO updates"
+#| fig-cap: "Season-to-date median net YPP threshold (ELO update signal) by season. Week 1 uses the 5.5 historical fallback; subsequent weeks use the rolling median of prior weeks."
+
+# Reconstruct the weekly_med values for visualisation
+played_vis = g[g["yds_per_play"].notna()].sort_values(["season","week","game_id"])
+wk_med_vis = {}
+for (season, week), grp in played_vis.groupby(["season","week"]):
+    wk_med_vis[(season, week)] = grp["yds_per_play"].median()
+
+YPP_FALLBACK = 5.5
+thresh_rows = []
+season_running_vis = {}
+for (season, week) in sorted(wk_med_vis.keys()):
+    prev = season_running_vis.get(season, [])
+    thresh = float(np.median(prev)) if prev else YPP_FALLBACK
+    thresh_rows.append({"season": season, "week": week, "threshold": thresh,
+                        "actual_median": wk_med_vis[(season, week)]})
+    season_running_vis.setdefault(season, []).append(wk_med_vis[(season, week)])
+
+thresh_df = pd.DataFrame(thresh_rows)
+
+fig = go.Figure()
+seasons_plot = sorted(thresh_df["season"].unique())
+palette = [BLUE, TEAL, AMBER, PURPLE, RED, GREEN, BEARS, SLATE]
+for i, season in enumerate(seasons_plot):
+    sd = thresh_df[thresh_df["season"] == season].sort_values("week")
+    color = palette[i % len(palette)]
+    fig.add_trace(go.Scatter(
+        x=sd["week"], y=sd["threshold"], mode="lines+markers",
+        name=str(season), line=dict(color=color, width=1.8),
+        marker=dict(size=5, color=color),
+        hovertemplate=f"<b>{season}</b> W%{{x}}: threshold=%{{y:.2f}}<extra></extra>"))
+
+fig.add_hline(y=YPP_FALLBACK, line_dash="dot", line_color=SLATE, line_width=1.2,
+              annotation_text=f"Wk1 fallback ({YPP_FALLBACK})",
+              annotation_font_color=SLATE, annotation_position="top right")
+fig.update_layout(
+    xaxis=dict(title="Week", dtick=2),
+    yaxis=dict(title="Season-to-date median net YPP threshold", range=[4.5, 6.5]),
+    showlegend=True,
+    legend=dict(title="Season", x=1.01, y=1, font=dict(size=11)))
+clean_fig(fig, height=420).show()
+```
+
+## 5. Rolling pre-game features
+
+```{python}
+#| label: rolling
+#| code-summary: "Compute rolling features — dual window, leakage-free SOS, TO split"
+
+def compute_rolling(g):
+    REGRESS   = 1/3
+    EWMA_SPAN = 4
+
+    off_cols = ["net_ypa","comp_pct","yds_per_carry","third_down_rate",
+                "turnovers_total","first_downs_total","time_of_possession_sec",
+                "pressure_rate","bad_throw_rate","yac_per_carry",
+                "rush_yards","pass_yards","point_diff_capped"]
+    def_cols = ["def_comp_pct","def_yds_per_tgt","def_pressure_rate",
+                "def_miss_tkl_pct","def_sacks","def_ints","def_yac_allowed"]
+    all_cols  = list(dict.fromkeys(off_cols + def_cols))
+
+    # Renamed from 'played' to avoid shadowing the outer played variable
+    g_played = g[g["win"].notna()].copy().sort_values(["season","week","team"])
+
+    lg_mean_nypa    = g_played.groupby("season")["net_ypa"].mean().to_dict()
+    lg_mean_def_yds = g_played.groupby("season")["def_yds_per_tgt"].mean().to_dict()
+
+    seas_avg_nypa    = g_played.groupby(["season","team"])["net_ypa"].mean()
+    seas_avg_def_yds = g_played.groupby(["season","team"])["def_yds_per_tgt"].mean()
+
+    prior_nypa    = {}
+    prior_def_yds = {}
+    for (season, team), val in seas_avg_nypa.items():
+        lm = lg_mean_nypa.get(season, np.nan)
+        prior_nypa[(season + 1, team)] = (
+            val * (1 - REGRESS) + lm * REGRESS if pd.notna(val) and pd.notna(lm) else lm)
+    for (season, team), val in seas_avg_def_yds.items():
+        lm = lg_mean_def_yds.get(season, np.nan)
+        prior_def_yds[(season + 1, team)] = (
+            val * (1 - REGRESS) + lm * REGRESS if pd.notna(val) and pd.notna(lm) else lm)
+
+    opp_nypa_lookup    = {}
+    opp_def_yds_lookup = {}
+
+    for (team, season), grp in g_played.groupby(["team","season"]):
+        grp = grp.sort_values("week").copy()
+        nypa_rolled    = grp["net_ypa"].expanding().mean().shift(1)
+        def_yds_rolled = grp["def_yds_per_tgt"].expanding().mean().shift(1)
+        seed_nypa    = prior_nypa.get(   (season, team), lg_mean_nypa.get(season, np.nan))
+        seed_def_yds = prior_def_yds.get((season, team), lg_mean_def_yds.get(season, np.nan))
+        nypa_rolled    = nypa_rolled.fillna(seed_nypa)
+        def_yds_rolled = def_yds_rolled.fillna(seed_def_yds)
+        for week, nypa_val, def_val in zip(grp["week"], nypa_rolled, def_yds_rolled):
+            opp_nypa_lookup[   (season, team, week)] = nypa_val
+            opp_def_yds_lookup[(season, team, week)] = def_val
+
+    g_played["opp_roll_nypa"] = g_played.apply(
+        lambda r: opp_nypa_lookup.get(
+            (r["season"], r["opponent"], r["week"]),
+            lg_mean_nypa.get(r["season"], np.nan)), axis=1)
+    g_played["opp_roll_def_yds"] = g_played.apply(
+        lambda r: opp_def_yds_lookup.get(
+            (r["season"], r["opponent"], r["week"]),
+            lg_mean_def_yds.get(r["season"], np.nan)), axis=1)
+
+    g_played["nypa_sos"]    = g_played["net_ypa"]         - g_played["opp_roll_nypa"]
+    g_played["def_yds_sos"] = g_played["def_yds_per_tgt"] - g_played["opp_roll_def_yds"]
+
+    sos_cols      = ["nypa_sos","def_yds_sos"]
+    all_roll_cols = all_cols + sos_cols
+
+    seas_avg_full = g_played.groupby(["season","team"])[all_roll_cols].mean()
+    # League mean computed per season using only that season's games — correct for
+    # seeding the NEXT season. e.g. lg_mean_full[2024] seeds 2025 Week 1.
+    # We do NOT use a cross-season league mean to avoid even minor contamination.
+    lg_mean_full  = g_played.groupby("season")[all_roll_cols].mean()
+
+    prior_fill = {}
+    for (season, team), row in seas_avg_full.iterrows():
+        # lm is the league average FOR season S, used to regress team S avg toward
+        # before seeding season S+1. This is always historically known — correct.
+        lm = lg_mean_full.loc[season]
+        prior_fill[(season + 1, team)] = {
+            c: (row[c] * (1 - REGRESS) + lm[c] * REGRESS
+                if pd.notna(row[c]) and pd.notna(lm[c]) else lm.get(c, np.nan))
+            for c in all_roll_cols}
+
+    g_played = g_played.sort_values(["team","season","week"])
+    parts  = []
+    ewm_cols = ["net_ypa","def_yds_per_tgt","point_diff_capped",
+                "third_down_rate","turnovers_total","pressure_rate"]
+
+    for (team, season), grp in g_played.groupby(["team","season"]):
+        grp = grp.sort_values("week").copy()
+        for c in all_roll_cols:
+            rolled = grp[c].expanding().mean().shift(1)
+            fill   = prior_fill.get((season, team), {}).get(c, np.nan)
+            grp[f"roll_{c}"] = rolled.fillna(fill)
+        for c in ewm_cols:
+            ewm_r = grp[c].ewm(span=EWMA_SPAN, adjust=False).mean().shift(1)
+            fill  = prior_fill.get((season, team), {}).get(c, np.nan)
+            grp[f"roll_ewm_{c}"] = ewm_r.fillna(fill)
+        for c in ["def_ints","fumbles_lost"]:
+            rolled = grp[c].expanding().mean().shift(1)
+            fill   = prior_fill.get((season, team), {}).get(c, np.nan)
+            grp[f"roll_{c}_split"] = rolled.fillna(fill)
+
+        out_cols = (["game_id","team"]
+                    + [f"roll_{c}" for c in all_roll_cols]
+                    + [f"roll_ewm_{c}" for c in ewm_cols]
+                    + ["roll_def_ints_split","roll_fumbles_lost_split"])
+        parts.append(grp[[c for c in out_cols if c in grp.columns]])
+
+    roll = pd.concat(parts, ignore_index=True)
+
+    # Unplayed-game rolling fill uses the LAST known rolling value
+    # per team (not a mean of raw stats), correctly respecting shift(1) ordering.
+    unplayed = g[(g["season"] == 2025) & g["win"].isna()]
+    if len(unplayed) > 0:
+        roll_c = [c for c in roll.columns if c not in ["game_id","team"]]
+        # For each team, take the last available rolled row from the played 2025 slice
+        played_25_roll = (
+            g_played[g_played["season"] == 2025][["game_id","team","week"]]
+            .merge(roll, on=["game_id","team"], how="left")
+            .sort_values(["team","week"])
+        )
+        latest_roll = (played_25_roll.groupby("team")[roll_c]
+                       .last().reset_index())
+        rows = []
+        for _, r in unplayed.iterrows():
+            team_row = latest_roll[latest_roll["team"] == r["team"]]
+            entry = {"game_id": r["game_id"], "team": r["team"]}
+            if len(team_row) > 0:
+                for c in roll_c:
+                    entry[c] = team_row[c].values[0]
+            else:
+                for c in roll_c:
+                    entry[c] = np.nan
+            rows.append(entry)
+        roll = pd.concat([roll, pd.DataFrame(rows)], ignore_index=True)
+
+    return roll
+
+roll_df = compute_rolling(g)
+
+# ── Build full feature matrix ─────────────────────────────────────────────────
+feat = g[["game_id","team","opponent","season","week",
+          "is_home","rest","opp_rest","win","point_diff","net_rest_diff",
+          "is_division_game","point_diff_capped",
+          "spread_line_team","total_line","team_score","opp_score",
+          "net_ypa"]].copy()
+
+feat = feat.merge(roll_df, on=["game_id","team"], how="left")
+
+opp_roll = roll_df.rename(columns={"team":"opponent"})
+opp_roll.columns = [
+    c if c in ["game_id","opponent"] else f"opp_{c}"
+    for c in opp_roll.columns]
+feat = feat.merge(opp_roll, on=["game_id","opponent"], how="left")
+feat = feat.merge(elo_df,   on=["game_id","team"],     how="left")
+
+# Matchup differentials
+diff_pairs = [
+    ("roll_net_ypa",          "opp_roll_net_ypa"),
+    ("roll_comp_pct",         "opp_roll_comp_pct"),
+    ("roll_turnovers_total",  "opp_roll_turnovers_total"),
+    ("roll_third_down_rate",  "opp_roll_third_down_rate"),
+    ("roll_pressure_rate",    "opp_roll_pressure_rate"),
+    ("roll_yac_per_carry",    "opp_roll_yac_per_carry"),
+]
+for tc, oc in diff_pairs:
+    feat[f"diff_{tc.replace('roll_','')}"] = feat[tc] - feat[oc]
+
+feat["matchup_pass_eff"] = feat["roll_net_ypa"]       - feat["opp_roll_def_yds_per_tgt"]
+feat["matchup_pressure"] = feat["roll_pressure_rate"] - feat["opp_roll_def_pressure_rate"]
+feat["diff_nypa_sos"]    = feat["roll_nypa_sos"]    - feat["opp_roll_nypa_sos"]
+feat["diff_def_yds_sos"] = feat["roll_def_yds_sos"] - feat["opp_roll_def_yds_sos"]
+
+# Stakes flags
+stakes_cols = ["game_id","team","team_clinched","team_eliminated",
+               "opp_clinched","opp_eliminated","game_low_stakes"]
+feat = feat.merge(g[stakes_cols], on=["game_id","team"], how="left")
+for col in ["team_clinched","team_eliminated","opp_clinched",
+            "opp_eliminated","game_low_stakes"]:
+    feat[col] = feat[col].fillna(0).astype(int)
+
+feat["is_week18"] = (feat["week"] == 18).astype(int)
+
+print(f"Feature matrix: {feat.shape[0]:,} rows x {feat.shape[1]} columns")
+```
+
+## 6. Feature sets
+
+```{python}
+#| label: feature-sets
+#| code-summary: "Define base feature list and vegas-augmented feature list"
+
+# ── Base features (no vegas) ──────────────────────────────────────────────────
+FEATURES = [
+    # ELO
+    "total_elo_diff", "off_elo_diff", "def_elo_diff",
+    "team_off_elo", "team_def_elo",
+    # Matchup differentials (expanding rolling)
+    "diff_net_ypa", "diff_comp_pct", "diff_turnovers_total",
+    "diff_third_down_rate", "diff_pressure_rate", "diff_yac_per_carry",
+    "matchup_pass_eff", "matchup_pressure",
+    # SOS-adjusted matchup differentials
+    "diff_nypa_sos", "diff_def_yds_sos",
+    # Team rolling quality (expanding)
+    "roll_net_ypa", "roll_turnovers_total", "roll_third_down_rate",
+    "roll_def_yds_per_tgt", "roll_def_pressure_rate",
+    "roll_def_ints", "roll_def_sacks",
+    "roll_pressure_rate", "roll_yac_per_carry",
+    # Capped point differential
+    "roll_point_diff_capped",
+    # Recency window (4-game EWM)
+    "roll_ewm_net_ypa", "roll_ewm_def_yds_per_tgt",
+    "roll_ewm_point_diff_capped", "roll_ewm_third_down_rate",
+    "roll_ewm_turnovers_total", "roll_ewm_pressure_rate",
+    # Forced vs unforced turnover split
+    "roll_def_ints_split",
+    "roll_fumbles_lost_split",
+    # Context
+    "is_home", "rest", "opp_rest", "week",
+    "net_rest_diff", "is_division_game",
+    # Playoff-stakes flags
+    "team_clinched", "team_eliminated",
+    "opp_clinched",  "opp_eliminated",
+]
+
+# ── Vegas-augmented features — adds spread and total ─────────────────────────
+FEATURES_VEGAS = FEATURES + ["spread_line_team", "total_line"]
+
+print(f"Base features:  {len(FEATURES)}")
+print(f"Vegas features: {len(FEATURES_VEGAS)}")
+```
+
+---
+
+# Part III — Model Comparison (No Vegas)
+
+## 7. Train / test split
+
+All models use the same split:
+
+- **Train:** 2018–2024, Weeks 1–17 only
+- **Test:** 2025, Weeks 1–17 only (in-season; rows without a result yet are skipped)
+- **Week 18:** evaluated separately in Section 8b
+
+::: {.callout-important}
+**XGBoost early-stopping validation set.**  
+To prevent leakage, an internal out-of-time (OOT) validation slice
+(2023–2024 Weeks 1–17) is carved from the training window and used exclusively
+for early stopping. The 2025 test set is never seen during any part of training.
+:::
+
+```{python}
+#| label: split
+#| code-summary: "Define train/test masks — with OOT validation slice for XGBoost early stopping"
+
+# ── Primary masks ─────────────────────────────────────────────────────────────
+train_mask = (feat["season"].between(2018, 2024)
+              & feat["win"].notna()
+              & (feat["week"] != 18))
+
+test_mask  = ((feat["season"] == 2025)
+              & feat["win"].notna()
+              & (feat["week"] != 18))
+
+w18_mask   = ((feat["season"] == 2025)
+              & feat["win"].notna()
+              & (feat["week"] == 18))
+
+# ── Internal OOT validation slice (last 2 seasons of training window) ─────────
+# Used ONLY for XGBoost early stopping — never for reporting accuracy.
+# Splitting by season (rather than random rows) preserves time ordering and
+# prevents temporal leakage inside the training window.
+oot_mask   = (feat["season"].isin([2023, 2024])
+              & feat["win"].notna()
+              & (feat["week"] != 18))
+core_mask  = (feat["season"].between(2018, 2022)
+              & feat["win"].notna()
+              & (feat["week"] != 18))
+
+# Imputation median is always computed on the FULL training window (not just core),
+# so it is stable and unaffected by the OOT split.
+train_med_feat  = feat.loc[train_mask, FEATURES].median()
+train_med_featv = feat.loc[train_mask, FEATURES_VEGAS].median()
+
+X_train = feat.loc[train_mask, FEATURES].fillna(train_med_feat)
+y_train_cls = feat.loc[train_mask, "win"]
+y_train_reg = feat.loc[train_mask, "point_diff"]
+
+X_test  = feat.loc[test_mask, FEATURES].fillna(train_med_feat)
+y_test_cls  = feat.loc[test_mask, "win"]
+y_test_reg  = feat.loc[test_mask, "point_diff"]
+
+X_w18   = feat.loc[w18_mask, FEATURES].fillna(train_med_feat)
+y_w18   = feat.loc[w18_mask, "win"]
+
+# OOT slice (for early stopping only)
+X_oot   = feat.loc[oot_mask, FEATURES].fillna(train_med_feat)
+y_oot_cls = feat.loc[oot_mask, "win"]
+y_oot_reg = feat.loc[oot_mask, "point_diff"]
+
+# Vegas versions
+X_train_v = feat.loc[train_mask, FEATURES_VEGAS].fillna(train_med_featv)
+X_test_v  = feat.loc[test_mask,  FEATURES_VEGAS].fillna(train_med_featv)
+X_w18_v   = feat.loc[w18_mask,   FEATURES_VEGAS].fillna(train_med_featv)
+X_oot_v   = feat.loc[oot_mask,   FEATURES_VEGAS].fillna(train_med_featv)
+y_oot_cls_v = feat.loc[oot_mask, "win"]
+y_oot_reg_v = feat.loc[oot_mask, "point_diff"]
+
+print(f"Train (full):   {len(X_train):,} rows  |  Test: {len(X_test):,} rows  |  W18: {len(X_w18):,} rows")
+print(f"OOT val slice:  {len(X_oot):,} rows  (2023–2024 W1-17, early-stopping only)")
+
+# ── Game-level accuracy helper ────────────────────────────────────────────────
+def game_level_accuracy(test_df, pred_col, truth_col="win", id_col="game_id"):
+    """
+    Deduplicate to one prediction per game before computing accuracy.
+
+    Why this matters
+    ----------------
+    Each game appears twice in the dataset (once per team). Because
+    win_A = 1 - win_B, any model that is self-consistent (predicts A as
+    favourite <=> predicts B as underdog) will score identical accuracy on
+    team-rows vs game-rows. However a non-linear model like XGBoost is NOT
+    constrained to be antisymmetric — it can predict both teams as favourites
+    or both as underdogs for the same game. In those cases one row is correct
+    and one is wrong. Measuring accuracy on team-rows therefore gives a
+    potentially inflated number vs Vegas, which by construction picks exactly
+    one winner per game (spread_line_team > 0 for exactly one team).
+
+    Fix: keep only the home-team row for each game (arbitrary but consistent)
+    and compute accuracy on that deduplicated set. This is a strict game-level
+    metric comparable to the Vegas spread baseline.
+    """
+    # Keep one row per game — home team perspective (is_home == 1)
+    home_rows = test_df[test_df["is_home"] == 1].copy()
+    if len(home_rows) == 0:
+        # fallback: keep first row per game
+        home_rows = test_df.drop_duplicates(id_col, keep="first").copy()
+    correct = (home_rows[pred_col] == home_rows[truth_col]).mean()
+    return correct, len(home_rows)
+
+print("game_level_accuracy() helper defined")
+```
+
+## 7b. Leakage audit
+
+::: {.callout-important}
+**Data leakage audit.** Before reporting any accuracy numbers it is worth
+being explicit about what could cause inflated results and confirming each is
+handled correctly. A model that leaks future information into its training or
+test features will produce accuracy numbers that are impossible to replicate
+in live deployment, which undermines the entire analysis.
+
+| Risk | How it would leak | Status |
+|---|---|---|
+| **Rolling features** | Using game N stats to predict game N | `.shift(1)` applied to every expanding mean and EWM; Week 1 seeded from prior season ✅ |
+| **SOS adjustment** | Normalising game N by opponent's full-season average | Pre-game rolling opponent quality used; Week 1 seeded from prior season ✅ |
+| **ELO update** | Recording post-game ELO as pre-game feature | ELO snapshot taken *before* update in every game loop ✅ |
+| **Playoff stakes flags** | Using final-season clinch/elimination status | True pre-game snapshot built by processing games in chronological order ✅ |
+| **Train/test contamination** | Imputing test NAs with test median | `fillna` uses train-split median only; applied separately to test set ✅ |
+| **Target in features** | `point_diff`, `team_score`, `win` accessible in feat table | None appear in `FEATURES` or `FEATURES_VEGAS` lists ✅ |
+| **Vegas lines as non-vegas features** | `spread_line_team` leaking into base model | Excluded from `FEATURES`; only in `FEATURES_VEGAS` ✅ |
+| **2025 data contaminating train** | Full-dataset median/mean used for seeding | Rolling seeds use only prior-season averages; train median computed on train rows only ✅ |
+| **XGBoost early stopping on test set** | `eval_set=[(X_test, y_test)]` tunes rounds to 2025 | OOT slice (2023–2024) used for early stopping; 2025 test never seen during training ✅ |
+
+**Note on the accuracy numbers.** Results at ~77-79% are higher than raw Vegas (~71%). This is plausible because:
+(1) the model uses ELO + multiple rolling efficiency metrics that together carry
+genuine signal, (2) the 2025 season may be somewhat predictable (few
+major upsets in competitive games so far), and (3) the Vegas baseline in this dataset
+excludes ties and games with missing spreads which may shift the denominator.
+The model should be presented honestly as competitive with but not definitively
+beating Vegas — a cross-season test across multiple years would be the right
+validation for that claim.
+:::
+
+```{python}
+#| label: leakage-check
+#| code-summary: "Programmatic leakage checks"
+
+# ── 1. Confirm no target columns in feature lists ─────────────────────────────
+target_cols  = ["win", "point_diff", "team_score", "opp_score", "point_diff_capped"]
+bad_base     = [c for c in target_cols if c in FEATURES]
+bad_vegas    = [c for c in target_cols if c in FEATURES_VEGAS]
+print("Target cols in FEATURES:       ", bad_base  if bad_base  else "none ✅")
+print("Target cols in FEATURES_VEGAS: ", bad_vegas if bad_vegas else "none ✅")
+
+# ── 2. Confirm vegas features not in base model ───────────────────────────────
+vegas_only = ["spread_line_team", "total_line"]
+leaked_vegas = [c for c in vegas_only if c in FEATURES]
+print("Vegas cols in base FEATURES:   ", leaked_vegas if leaked_vegas else "none ✅")
+
+# ── 3. Confirm rolling features are shift(1) by checking Week 1 values ────────
+# For Week 1 games the rolling feature should equal the prior-season seed,
+# not the current game's stat. Check that roll_net_ypa at Week 1 != net_ypa.
+w1 = feat[(feat["week"] == 1) & feat["win"].notna() & feat["roll_net_ypa"].notna()].copy()
+same_as_current = (w1["roll_net_ypa"].round(4) == w1["net_ypa"].round(4)).sum()
+print(f"\nWeek 1 rows where roll_net_ypa == net_ypa (should be ~0): {same_as_current}")
+print(f"  (any non-zero value here would indicate a shift() failure)")
+
+# ── 4. Confirm stakes flags are pre-game (Week 1 teams should all be 0) ───────
+w1_stakes = feat[feat["week"] == 1][["team_clinched","team_eliminated",
+                                      "opp_clinched","opp_eliminated"]].sum()
+print(f"\nWeek 1 stakes flags (all should be 0):")
+print(w1_stakes.to_string())
+
+# ── 5. Check train/test date boundaries ───────────────────────────────────────
+print(f"\nTrain seasons: {feat.loc[train_mask, 'season'].unique().tolist()}")
+print(f"Test seasons:  {feat.loc[test_mask,  'season'].unique().tolist()}")
+print(f"Train weeks:   {sorted(feat.loc[train_mask, 'week'].unique().tolist())}")
+print(f"Test weeks:    {sorted(feat.loc[test_mask,  'week'].unique().tolist())}")
+
+# ── 6. Confirm imputation uses train median only ──────────────────────────────
+train_med = feat.loc[train_mask, FEATURES].median()
+test_med  = feat.loc[test_mask,  FEATURES].median()
+max_diff  = (train_med - test_med).abs().max()
+print(f"\nMax diff between train and test medians: {max_diff:.4f}")
+print("  (non-zero confirms test was NOT used to compute imputation values)")
+```
+
+## 8. Model suite — win / loss classification
+
+Five model types are compared on direct win/loss prediction.
+XGBoost and Random Forest are **non-linear** tree ensembles; Logistic Regression
+with L2 penalty is a **linear** classifier. This contrast is useful when
+presenting: the gap between linear and non-linear accuracy shows how much the
+relationships in the data depart from linearity.
+
+::: {.callout-important}
+**Walk-forward cross-validation for hyperparameter selection.**  
+Hyperparameters are selected via a time-series-aware CV grid search. Each fold
+trains on seasons up to year S and validates on year S+1, covering seasons
+2019→2020, 2020→2021, 2021→2022, and 2022→2023. The best hyperparameters are
+then used to train the final model on the **full 2018–2024 window**. This
+preserves temporal order, avoids leakage, and gives a principled basis for the
+chosen configuration. XGBoost early stopping inside each CV fold also uses the
+fold's validation split — never the 2025 test set.
+:::
+
+```{python}
+#| label: train-classifiers
+#| code-summary: "Walk-forward CV hyperparameter search + final classifier training"
+
+from xgboost import XGBClassifier
+from sklearn.ensemble import RandomForestClassifier
+from sklearn.linear_model import LogisticRegression, RidgeClassifier
+from sklearn.metrics import (accuracy_score, brier_score_loss,
+                             log_loss, roc_auc_score)
+from sklearn.preprocessing import StandardScaler
+from itertools import product as iterproduct
+
+# ── Walk-forward CV folds: train on [2018..S], validate on [S+1] ─────────────
+WF_FOLDS = [
+    (list(range(2018, 2020)), 2020),
+    (list(range(2018, 2021)), 2021),
+    (list(range(2018, 2022)), 2022),
+    (list(range(2018, 2023)), 2023),
+]
+
+def wf_mask(feat, train_seasons, val_season, week_excl=18):
+    tr = (feat["season"].isin(train_seasons) & feat["win"].notna()
+          & (feat["week"] != week_excl))
+    vl = ((feat["season"] == val_season)     & feat["win"].notna()
+          & (feat["week"] != week_excl))
+    return tr, vl
+
+def wf_cv_score(feat, features, model_fn, param_dict):
+    """
+    Walk-forward CV accuracy for a given model factory and hyperparams.
+    model_fn(params) → fitted model.  Imputation uses fold train median only.
+
+    Scaler handling
+    ---------------
+    Some model factories (MLP, Logistic Regression) fit a StandardScaler on
+    Xtr and store it as mdl._scaler_cv. The validation set Xvl must be
+    transformed by the SAME fitted scaler — not refit on Xvl — before
+    calling predict_proba. Failing to do this causes the MLP to predict on
+    unscaled data despite being trained on scaled data, which depresses CV
+    accuracy and may lead to incorrect hyperparameter selection.
+    This fix checks for _scaler_cv and applies it to Xvl when present.
+    """
+    fold_accs = []
+    for tr_seasons, val_season in WF_FOLDS:
+        tr_m, vl_m = wf_mask(feat, tr_seasons, val_season)
+        med = feat.loc[tr_m, features].median()
+        Xtr = feat.loc[tr_m, features].fillna(med).values
+        ytr = feat.loc[tr_m, "win"].values
+        Xvl = feat.loc[vl_m, features].fillna(med).values
+        yvl = feat.loc[vl_m, "win"].values
+        mdl = model_fn(param_dict, Xtr, ytr)
+        # Apply factory scaler to val set if the model stored one
+        if hasattr(mdl, "_scaler_cv"):
+            Xvl_pred = mdl._scaler_cv.transform(Xvl)
+        else:
+            Xvl_pred = Xvl
+        if hasattr(mdl, "predict_proba"):
+            preds = (mdl.predict_proba(Xvl_pred)[:, 1] >= 0.5).astype(int)
+        else:
+            preds = mdl.predict(Xvl_pred)
+            preds = (preds > 0).astype(int) if preds.dtype == float else preds
+        fold_accs.append(accuracy_score(yvl, preds))
+    return float(np.mean(fold_accs))
+
+# ── XGBoost CV grid ───────────────────────────────────────────────────────────
+xgb_grid = list(iterproduct(
+    [3, 4],          # max_depth
+    [0.03, 0.05],    # learning_rate
+    [0.6, 0.8],      # subsample
+))
+
+def _xgb_cls_factory(p, Xtr, ytr):
+    """Train XGBoost classifier; OOT split inside fold used for early stopping."""
+    n = len(Xtr)
+    split = int(n * 0.85)   # last 15% of fold-train as mini early-stop val
+    Xe, ye = Xtr[split:], ytr[split:]
+    Xtr2, ytr2 = Xtr[:split], ytr[:split]
+    m = XGBClassifier(
+        n_estimators=600, max_depth=p[0], learning_rate=p[1],
+        subsample=p[2], colsample_bytree=0.6, min_child_weight=15,
+        reg_alpha=1.0, reg_lambda=5.0, gamma=1.0,
+        random_state=42, eval_metric="logloss", early_stopping_rounds=40,
+        verbosity=0)
+    m.fit(Xtr2, ytr2, eval_set=[(Xe, ye)], verbose=False)
+    return m
+
+print("XGBoost CV search …")
+best_xgb_params, best_xgb_score = None, -1
+for p in xgb_grid:
+    sc = wf_cv_score(feat, FEATURES, _xgb_cls_factory, p)
+    if sc > best_xgb_score:
+        best_xgb_score, best_xgb_params = sc, p
+print(f"  best params: max_depth={best_xgb_params[0]}, lr={best_xgb_params[1]}, "
+      f"subsample={best_xgb_params[2]}  →  CV acc={best_xgb_score:.4f}")
+
+# ── Random Forest CV grid ─────────────────────────────────────────────────────
+rf_grid = list(iterproduct([5, 6, 8], [15, 25]))  # max_depth, min_samples_leaf
+
+def _rf_cls_factory(p, Xtr, ytr):
+    m = RandomForestClassifier(
+        n_estimators=500, max_depth=p[0], min_samples_leaf=p[1],
+        max_features="sqrt", random_state=42, n_jobs=-1)
+    m.fit(Xtr, ytr)
+    return m
+
+print("Random Forest CV search …")
+best_rf_params, best_rf_score = None, -1
+for p in rf_grid:
+    sc = wf_cv_score(feat, FEATURES, _rf_cls_factory, p)
+    if sc > best_rf_score:
+        best_rf_score, best_rf_params = sc, p
+print(f"  best params: max_depth={best_rf_params[0]}, min_samples_leaf={best_rf_params[1]}"
+      f"  →  CV acc={best_rf_score:.4f}")
+
+# ── Logistic Regression CV grid ───────────────────────────────────────────────
+lr_C_grid = [0.1, 0.5, 1.0, 5.0]
+
+def _lr_cls_factory(p, Xtr, ytr):
+    sc = StandardScaler(); Xtr_sc = sc.fit_transform(Xtr)
+    m = LogisticRegression(C=p[0], max_iter=1000, random_state=42)
+    m.fit(Xtr_sc, ytr)
+    m._scaler_cv = sc
+    return m
+
+print("Logistic Regression CV search …")
+best_lr_C, best_lr_score = None, -1
+for p in [(c,) for c in lr_C_grid]:
+    sc = wf_cv_score(feat, FEATURES, _lr_cls_factory, p)
+    if sc > best_lr_score:
+        best_lr_score, best_lr_C = sc, p[0]
+print(f"  best C={best_lr_C}  →  CV acc={best_lr_score:.4f}")
+
+# ── Ridge Classifier CV grid ──────────────────────────────────────────────────
+ridge_alpha_grid = [0.1, 1.0, 10.0, 50.0]
+
+def _ridge_cls_factory(p, Xtr, ytr):
+    sc = StandardScaler(); Xtr_sc = sc.fit_transform(Xtr)
+    m = RidgeClassifier(alpha=p[0])
+    m.fit(Xtr_sc, ytr)
+    return m
+
+print("Ridge Classifier CV search …")
+best_ridge_alpha, best_ridge_score = None, -1
+for p in [(a,) for a in ridge_alpha_grid]:
+    sc = wf_cv_score(feat, FEATURES, _ridge_cls_factory, p)
+    if sc > best_ridge_score:
+        best_ridge_score, best_ridge_alpha = sc, p[0]
+print(f"  best alpha={best_ridge_alpha}  →  CV acc={best_ridge_score:.4f}")
+
+# ── MLP (Neural Network) CV grid ─────────────────────────────────────────────
+# MLPClassifier is sklearn's feedforward network.
+# Architecture search: hidden layer sizes and regularisation alpha.
+# Scaling is applied inside the factory since MLP requires normalised inputs.
+from sklearn.neural_network import MLPClassifier
+
+mlp_grid = list(iterproduct(
+    [(64, 32), (128, 64), (64, 32, 16)],   # hidden_layer_sizes
+    [0.0001, 0.001, 0.01],                  # alpha (L2 regularisation)
+))
+
+def _mlp_cls_factory(p, Xtr, ytr):
+    sc = StandardScaler()
+    Xtr_sc = sc.fit_transform(Xtr)
+    m = MLPClassifier(
+        hidden_layer_sizes=p[0], alpha=p[1],
+        activation="relu", solver="adam",
+        max_iter=500, random_state=42,
+        early_stopping=True, validation_fraction=0.12,
+        n_iter_no_change=20, tol=1e-4,
+        shuffle=False)   # temporal val split: last 12% of fold-train rows
+    m.fit(Xtr_sc, ytr)
+    m._scaler_cv = sc
+    return m
+
+print("MLP (Neural Network) CV search …")
+best_mlp_params, best_mlp_score = None, -1
+for p in mlp_grid:
+    sc = wf_cv_score(feat, FEATURES, _mlp_cls_factory, p)
+    if sc > best_mlp_score:
+        best_mlp_score, best_mlp_params = sc, p
+print(f"  best hidden_layers={best_mlp_params[0]}, alpha={best_mlp_params[1]}"
+      f"  →  CV acc={best_mlp_score:.4f}")
+
+# ── Final model training on full 2018-2024 window ────────────────────────────
+# XGBoost: OOT slice (X_oot) used for early stopping — 2025 test never touched
+scaler_cls = StandardScaler()
+X_train_sc = scaler_cls.fit_transform(X_train)
+X_test_sc  = scaler_cls.transform(X_test)
+
+xgb_cls = XGBClassifier(
+    n_estimators=600, max_depth=best_xgb_params[0],
+    learning_rate=best_xgb_params[1], subsample=best_xgb_params[2],
+    colsample_bytree=0.6, min_child_weight=15,
+    reg_alpha=1.0, reg_lambda=5.0, gamma=1.0,
+    random_state=42, eval_metric="logloss", early_stopping_rounds=40,
+    verbosity=0)
+xgb_cls.fit(X_train, y_train_cls,
+            eval_set=[(X_oot, y_oot_cls)], verbose=False)
+
+rf_cls = RandomForestClassifier(
+    n_estimators=500, max_depth=best_rf_params[0],
+    min_samples_leaf=best_rf_params[1],
+    max_features="sqrt", random_state=42, n_jobs=-1)
+rf_cls.fit(X_train, y_train_cls)
+
+lr_cls = LogisticRegression(C=best_lr_C, max_iter=1000, random_state=42)
+lr_cls.fit(X_train_sc, y_train_cls)
+
+ridge_cls = RidgeClassifier(alpha=best_ridge_alpha)
+ridge_cls.fit(X_train_sc, y_train_cls)
+
+# MLP: scaler fitted on full training window — separate from scaler_cls
+# so each model owns its own normalisation and they don't interfere
+scaler_mlp = StandardScaler()
+X_train_mlp = scaler_mlp.fit_transform(X_train)
+X_test_mlp  = scaler_mlp.transform(X_test)
+
+# shuffle=False so the early-stopping val split takes the LAST 12% of the
+# training window (temporally most recent rows ≈ late 2024) rather than a
+# random stratified sample. This is more appropriate for time-series data.
+mlp_cls = MLPClassifier(
+    hidden_layer_sizes=best_mlp_params[0], alpha=best_mlp_params[1],
+    activation="relu", solver="adam",
+    max_iter=500, random_state=42,
+    early_stopping=True, validation_fraction=0.12,
+    n_iter_no_change=20, tol=1e-4,
+    shuffle=False)
+mlp_cls.fit(X_train_mlp, y_train_cls)
+print(f"MLP trained: {len(mlp_cls.loss_curve_)} iterations | "
+      f"best val loss={min(mlp_cls.validation_scores_):.4f}")
+
+# ── Vegas baseline ────────────────────────────────────────────────────────────
+vegas_pred = (feat.loc[test_mask, "spread_line_team"] > 0).astype(int)
+
+# ── Collect metrics ───────────────────────────────────────────────────────────
+def cls_metrics(model, X_tr, X_te, y_tr, y_te, scaled=False, is_ridge=False,
+                test_df_ref=None):
+    """
+    Collect classifier metrics. Reports both team-row accuracy (for reference)
+    and game-level accuracy (primary metric, one prediction per game).
+    test_df_ref: the feat slice for the test mask, used for game-level dedup.
+    """
+    if is_ridge:
+        prob_te = None
+        pred_te = model.predict(X_te)
+        pred_tr = model.predict(X_tr)
+    else:
+        prob_te = model.predict_proba(X_te)[:, 1]
+        prob_tr = model.predict_proba(X_tr)[:, 1]
+        pred_te = (prob_te >= 0.5).astype(int)
+        pred_tr = (prob_tr >= 0.5).astype(int)
+    acc_te_row = accuracy_score(y_te, pred_te)    # team-row accuracy
+    acc_tr     = accuracy_score(y_tr, pred_tr)
+    auc        = roc_auc_score(y_te, prob_te) if prob_te is not None else np.nan
+    brier      = brier_score_loss(y_te, prob_te) if prob_te is not None else np.nan
+    ll         = log_loss(y_te, prob_te) if prob_te is not None else np.nan
+
+    # Game-level accuracy (primary)
+    if test_df_ref is not None:
+        tmp = test_df_ref.copy()
+        tmp["_pred"] = pred_te
+        acc_te_game, _ = game_level_accuracy(tmp, "_pred", "win")
+    else:
+        acc_te_game = acc_te_row   # fallback if ref not provided
+
+    return {
+        "Test Acc (game)":  round(acc_te_game, 4),   # PRIMARY
+        "Test Acc (row)":   round(acc_te_row,  4),   # reference
+        "Train Accuracy":   round(acc_tr, 4),
+        "Train-Test Gap":   round(acc_tr - acc_te_game, 4),
+        "AUC-ROC":    round(auc,   4) if not np.isnan(auc)   else "—",
+        "Brier Score": round(brier, 4) if not np.isnan(brier) else "—",
+        "Log Loss":    round(ll,   4) if not np.isnan(ll)    else "—",
+        "_prob": prob_te,
+        "_pred": pred_te,
+    }
+
+# ── Game-level Vegas baseline (primary — one unique prediction per game) ──────
+test_df_ref   = feat.loc[test_mask].copy()
+home_test     = test_df_ref[test_df_ref["is_home"] == 1]
+vegas_acc_game = accuracy_score(
+    home_test["win"],
+    (home_test["spread_line_team"] > 0).astype(int))
+vegas_acc_row  = accuracy_score(       # team-row reference
+    test_df_ref["win"],
+    (test_df_ref["spread_line_team"] > 0).astype(int))
+# keep vegas_acc as alias for downstream code
+vegas_acc = vegas_acc_game
+
+results_cls = {
+    "XGBoost":             cls_metrics(xgb_cls,   X_train,     X_test,
+                                       y_train_cls, y_test_cls, test_df_ref=test_df_ref),
+    "Random Forest":       cls_metrics(rf_cls,    X_train,     X_test,
+                                       y_train_cls, y_test_cls, test_df_ref=test_df_ref),
+    "Logistic Regression": cls_metrics(lr_cls,    X_train_sc,  X_test_sc,
+                                       y_train_cls, y_test_cls, scaled=True,
+                                       test_df_ref=test_df_ref),
+    "Ridge Classifier":    cls_metrics(ridge_cls, X_train_sc,  X_test_sc,
+                                       y_train_cls, y_test_cls,
+                                       scaled=True, is_ridge=True,
+                                       test_df_ref=test_df_ref),
+    "Neural Network (MLP)": cls_metrics(mlp_cls,  X_train_mlp, X_test_mlp,
+                                        y_train_cls, y_test_cls,
+                                        test_df_ref=test_df_ref),
+}
+
+display_cols = ["Test Acc (game)", "Test Acc (row)", "Train Accuracy",
+                "Train-Test Gap", "AUC-ROC", "Brier Score", "Log Loss"]
+tbl = pd.DataFrame({k: {c: v[c] for c in display_cols}
+                     for k, v in results_cls.items()}).T
+tbl.index.name = "Model"
+tbl["vs Vegas"] = (tbl["Test Acc (game)"].astype(float) - vegas_acc_game).round(4)
+print(f"Vegas — game-level: {vegas_acc_game:.4f} | team-row: {vegas_acc_row:.4f}")
+print("(Primary metric is game-level — one independent prediction per game)\n")
+print(tbl.to_string())
+```
+
+
+```{python}
+#| label: fig-mlp-training
+#| code-summary: "MLP training loss curve diagnostic"
+#| fig-cap: "MLP training and validation loss curves. Convergence pattern and early-stopping point indicate whether the network is over/under-fitting."
+
+fig = go.Figure()
+fig.add_trace(go.Scatter(
+    x=list(range(1, len(mlp_cls.loss_curve_) + 1)),
+    y=mlp_cls.loss_curve_,
+    mode="lines", name="Training loss",
+    line=dict(color=BLUE, width=2)))
+if hasattr(mlp_cls, "validation_scores_") and mlp_cls.validation_scores_:
+    # validation_scores_ is accuracy; convert to rough proxy loss for visual
+    val_loss = [1 - s for s in mlp_cls.validation_scores_]
+    fig.add_trace(go.Scatter(
+        x=list(range(1, len(val_loss) + 1)),
+        y=val_loss,
+        mode="lines", name="Validation loss (1 − acc)",
+        line=dict(color=AMBER, width=2, dash="dash")))
+fig.add_vline(x=mlp_cls.best_loss_ if (hasattr(mlp_cls, "best_loss_") and mlp_cls.best_loss_ is not None) else len(mlp_cls.loss_curve_),
+              line_dash="dot", line_color=SLATE, line_width=1.2,
+              annotation_text="Early stop", annotation_font_color=SLATE)
+fig.update_layout(
+    xaxis_title="Epoch", yaxis_title="Loss",
+    showlegend=True,
+    legend=dict(x=0.65, y=0.95, bgcolor="rgba(255,255,255,0.85)"))
+clean_fig(fig, height=380).show()
+```
+
+```{python}
+#| label: fig-cls-comparison
+#| fig-cap: "Win/loss classifier accuracy — all models vs Vegas baseline (2025 W1-17 holdout)."
+
+model_names = list(results_cls.keys())
+test_accs   = [results_cls[m]["Test Acc (game)"] for m in model_names]
+train_accs  = [results_cls[m]["Train Accuracy"] for m in model_names]
+
+colors = [BLUE, TEAL, AMBER, PURPLE, GREEN]
+
+fig = go.Figure()
+fig.add_trace(go.Bar(
+    x=model_names, y=test_accs,
+    name="Test accuracy",
+    marker_color=colors, marker_line_width=0,
+    text=[f"{v:.3f}" for v in test_accs],
+    textposition="outside", textfont=dict(size=11)))
+
+fig.add_hline(y=vegas_acc, line_dash="dot", line_color=RED, line_width=2,
+              annotation_text=f"Vegas {vegas_acc:.3f}",
+              annotation_font_color=RED, annotation_position="top right")
+
+fig.update_layout(
+    showlegend=False,
+    xaxis_title=None,
+    yaxis=dict(title="Test accuracy (2025 W1–17)", tickformat=".0%",
+               range=[min(test_accs + [vegas_acc]) - 0.03,
+                      max(test_accs + [vegas_acc]) + 0.06]))
+clean_fig(fig).show()
+```
+
+```{python}
+#| label: fig-cls-linear-vs-nonlinear
+#| fig-cap: "Linear vs non-linear model accuracy gap — a useful talking point for presentations."
+
+linear_avg    = np.mean([results_cls["Logistic Regression"]["Test Acc (game)"],
+                          results_cls["Ridge Classifier"]["Test Acc (game)"]])
+nonlinear_avg = np.mean([results_cls["XGBoost"]["Test Acc (game)"],
+                          results_cls["Random Forest"]["Test Acc (game)"]])
+nn_acc        = results_cls["Neural Network (MLP)"]["Test Acc (game)"]
+
+group_names  = ["Linear\n(Logistic / Ridge)", "Non-linear trees\n(XGBoost / RF)", "Neural Network\n(MLP)"]
+group_accs   = [linear_avg, nonlinear_avg, nn_acc]
+group_colors = [AMBER, BLUE, GREEN]
+
+fig = go.Figure()
+fig.add_trace(go.Bar(
+    x=group_names, y=group_accs,
+    marker_color=group_colors, marker_line_width=0,
+    text=[f"{v:.3f}" for v in group_accs],
+    textposition="outside", textfont=dict(size=12)))
+
+fig.add_hline(y=vegas_acc, line_dash="dot", line_color=RED, line_width=2,
+              annotation_text=f"Vegas {vegas_acc:.3f}",
+              annotation_font_color=RED, annotation_position="top right")
+
+fig.update_layout(
+    showlegend=False,
+    yaxis=dict(title="Test accuracy (game-level)", tickformat=".0%",
+               range=[min(group_accs + [vegas_acc]) - 0.04,
+                      max(group_accs + [vegas_acc]) + 0.07]))
+clean_fig(fig, height=380).show()
+```
+
+::: {.callout-note}
+**Linear vs non-linear: the presentation story.** Tree ensembles (XGBoost,
+Random Forest) can capture interaction effects — e.g. that a strong pass rush
+matters more against a team with a bad offensive line. Linear models (Logistic
+Regression, Ridge) assume each feature adds independently. The accuracy gap
+between these two families quantifies how much interaction structure exists in
+NFL game outcomes. If the gap is small, the underlying relationships are
+approximately linear and a simpler model would suffice. If it is large, the
+non-linear structure is real and the added complexity of a tree model is
+justified.
+:::
+
+## 9. Model suite — point differential regression
+
+Rather than predicting win/loss directly, these models predict the **actual
+point margin** (e.g. +7 or −3). A predicted margin > 0 is mapped back to a
+predicted win. This two-step approach sometimes outperforms direct classification
+because the regression target carries more information — a model that predicts
++14 vs +1 has learned something that a binary label collapses.
+
+```{python}
+#| label: train-regressors
+#| code-summary: "Walk-forward CV hyperparameter search + final regressor training"
+
+from xgboost import XGBRegressor
+from sklearn.ensemble import RandomForestRegressor
+from sklearn.linear_model import LinearRegression, Ridge
+from sklearn.metrics import mean_absolute_error, mean_squared_error
+from sklearn.neural_network import MLPRegressor
+
+def wf_cv_score_reg(feat, features, model_fn, param_dict):
+    """Walk-forward CV MAE for regressors."""
+    fold_maes = []
+    for tr_seasons, val_season in WF_FOLDS:
+        tr_m, vl_m = wf_mask(feat, tr_seasons, val_season)
+        med = feat.loc[tr_m, features].median()
+        Xtr = feat.loc[tr_m, features].fillna(med).values
+        ytr = feat.loc[tr_m, "point_diff"].values
+        Xvl = feat.loc[vl_m, features].fillna(med).values
+        yvl = feat.loc[vl_m, "point_diff"].values
+        mdl = model_fn(param_dict, Xtr, ytr)
+        preds = mdl.predict(Xvl)
+        fold_maes.append(mean_absolute_error(yvl, preds))
+    return float(np.mean(fold_maes))
+
+# ── XGBoost Regressor CV grid ────────────────────────────────────────────────
+def _xgb_reg_factory(p, Xtr, ytr):
+    n = len(Xtr); split = int(n * 0.85)
+    m = XGBRegressor(
+        n_estimators=600, max_depth=p[0], learning_rate=p[1],
+        subsample=p[2], colsample_bytree=0.6, min_child_weight=15,
+        reg_alpha=1.0, reg_lambda=5.0, gamma=1.0,
+        random_state=42, eval_metric="rmse", early_stopping_rounds=40,
+        verbosity=0)
+    m.fit(Xtr[:split], ytr[:split],
+          eval_set=[(Xtr[split:], ytr[split:])], verbose=False)
+    return m
+
+print("XGBoost Regressor CV search …")
+best_xgb_reg_params, best_xgb_reg_mae = None, np.inf
+for p in xgb_grid:
+    mae = wf_cv_score_reg(feat, FEATURES, _xgb_reg_factory, p)
+    if mae < best_xgb_reg_mae:
+        best_xgb_reg_mae, best_xgb_reg_params = mae, p
+print(f"  best params: depth={best_xgb_reg_params[0]}, lr={best_xgb_reg_params[1]}, "
+      f"sub={best_xgb_reg_params[2]}  →  CV MAE={best_xgb_reg_mae:.3f} pts")
+
+# ── RF Regressor CV grid ─────────────────────────────────────────────────────
+def _rf_reg_factory(p, Xtr, ytr):
+    m = RandomForestRegressor(
+        n_estimators=500, max_depth=p[0], min_samples_leaf=p[1],
+        max_features="sqrt", random_state=42, n_jobs=-1)
+    m.fit(Xtr, ytr); return m
+
+print("Random Forest Regressor CV search …")
+best_rf_reg_params, best_rf_reg_mae = None, np.inf
+for p in rf_grid:
+    mae = wf_cv_score_reg(feat, FEATURES, _rf_reg_factory, p)
+    if mae < best_rf_reg_mae:
+        best_rf_reg_mae, best_rf_reg_params = mae, p
+print(f"  best params: depth={best_rf_reg_params[0]}, min_leaf={best_rf_reg_params[1]}"
+      f"  →  CV MAE={best_rf_reg_mae:.3f} pts")
+
+# ── Ridge Regression CV grid ─────────────────────────────────────────────────
+def _ridge_reg_factory(p, Xtr, ytr):
+    sc = StandardScaler(); Xtr_sc = sc.fit_transform(Xtr)
+    m = Ridge(alpha=p[0]); m.fit(Xtr_sc, ytr); return m
+
+print("Ridge Regression CV search …")
+best_ridge_reg_alpha, best_ridge_reg_mae = None, np.inf
+for a in ridge_alpha_grid:
+    mae = wf_cv_score_reg(feat, FEATURES, _ridge_reg_factory, (a,))
+    if mae < best_ridge_reg_mae:
+        best_ridge_reg_mae, best_ridge_reg_alpha = mae, a
+print(f"  best alpha={best_ridge_reg_alpha}  →  CV MAE={best_ridge_reg_mae:.3f} pts")
+
+# ── Final regressor training on full 2018-2024 window ────────────────────────
+scaler_reg = StandardScaler()
+X_train_sc_r = scaler_reg.fit_transform(X_train)
+X_test_sc_r  = scaler_reg.transform(X_test)
+
+xgb_reg = XGBRegressor(
+    n_estimators=600, max_depth=best_xgb_reg_params[0],
+    learning_rate=best_xgb_reg_params[1], subsample=best_xgb_reg_params[2],
+    colsample_bytree=0.6, min_child_weight=15,
+    reg_alpha=1.0, reg_lambda=5.0, gamma=1.0,
+    random_state=42, eval_metric="rmse", early_stopping_rounds=40, verbosity=0)
+xgb_reg.fit(X_train, y_train_reg,
+            eval_set=[(X_oot, y_oot_reg)], verbose=False)
+
+rf_reg = RandomForestRegressor(
+    n_estimators=500, max_depth=best_rf_reg_params[0],
+    min_samples_leaf=best_rf_reg_params[1],
+    max_features="sqrt", random_state=42, n_jobs=-1)
+rf_reg.fit(X_train, y_train_reg)
+
+ols_reg = LinearRegression()
+ols_reg.fit(X_train_sc_r, y_train_reg)
+
+ridge_reg = Ridge(alpha=best_ridge_reg_alpha)
+ridge_reg.fit(X_train_sc_r, y_train_reg)
+
+# ── MLP Regressor (reuse CV-tuned architecture from classifier search) ────────
+mlp_reg = MLPRegressor(
+    hidden_layer_sizes=best_mlp_params[0], alpha=best_mlp_params[1],
+    activation="relu", solver="adam",
+    max_iter=500, random_state=42,
+    early_stopping=True, validation_fraction=0.12,
+    n_iter_no_change=20, tol=1e-4)
+mlp_reg.fit(X_train_mlp, y_train_reg)
+print(f"MLP Regressor trained: {len(mlp_reg.loss_curve_)} iterations")
+
+# ── Collect metrics ───────────────────────────────────────────────────────────
+def reg_metrics(model, X_tr, X_te, y_tr_cls, y_te_cls, y_tr_reg, y_te_reg,
+                test_df_ref=None):
+    pred_margin_te = model.predict(X_te)
+    pred_margin_tr = model.predict(X_tr)
+    pred_win_te    = (pred_margin_te > 0).astype(int)
+    pred_win_tr    = (pred_margin_tr > 0).astype(int)
+    acc_row = accuracy_score(y_te_cls, pred_win_te)
+    acc_tr  = accuracy_score(y_tr_cls, pred_win_tr)
+
+    # Game-level accuracy
+    if test_df_ref is not None:
+        tmp = test_df_ref.copy()
+        tmp["_pred"] = pred_win_te
+        acc_game, _ = game_level_accuracy(tmp, "_pred", "win")
+    else:
+        acc_game = acc_row
+
+    return {
+        "Test Acc (game)":            round(acc_game, 4),
+        "Test Acc (row)":             round(acc_row, 4),
+        "Train Accuracy (converted)": round(acc_tr, 4),
+        "Train-Test Gap":             round(acc_tr - acc_game, 4),
+        "Test MAE (pts)":             round(mean_absolute_error(y_te_reg, pred_margin_te), 3),
+        "Test RMSE (pts)":            round(np.sqrt(mean_squared_error(y_te_reg, pred_margin_te)), 3),
+        "_pred": pred_win_te,
+        "_margin": pred_margin_te,
+    }
+
+results_reg = {
+    "XGBoost Regressor":  reg_metrics(xgb_reg,   X_train,      X_test,
+                                      y_train_cls, y_test_cls, y_train_reg, y_test_reg,
+                                      test_df_ref=test_df_ref),
+    "Random Forest Reg":  reg_metrics(rf_reg,    X_train,      X_test,
+                                      y_train_cls, y_test_cls, y_train_reg, y_test_reg,
+                                      test_df_ref=test_df_ref),
+    "OLS":                reg_metrics(ols_reg,   X_train_sc_r, X_test_sc_r,
+                                      y_train_cls, y_test_cls, y_train_reg, y_test_reg,
+                                      test_df_ref=test_df_ref),
+    "Ridge Regression":   reg_metrics(ridge_reg, X_train_sc_r, X_test_sc_r,
+                                      y_train_cls, y_test_cls, y_train_reg, y_test_reg,
+                                      test_df_ref=test_df_ref),
+    "Neural Network (MLP)": reg_metrics(mlp_reg, X_train_mlp,  X_test_mlp,
+                                        y_train_cls, y_test_cls, y_train_reg, y_test_reg,
+                                        test_df_ref=test_df_ref),
+}
+
+reg_display_cols = ["Test Acc (game)", "Test Acc (row)", "Train Accuracy (converted)",
+                    "Train-Test Gap", "Test MAE (pts)", "Test RMSE (pts)"]
+tbl_reg = pd.DataFrame({k: {c: v[c] for c in reg_display_cols}
+                          for k, v in results_reg.items()}).T
+tbl_reg.index.name = "Model"
+tbl_reg["vs Vegas"] = (tbl_reg["Test Acc (game)"].astype(float) - vegas_acc_game).round(4)
+print(f"Vegas — game-level: {vegas_acc_game:.4f}\n")
+print(tbl_reg.to_string())
+```
+
+```{python}
+#| label: fig-reg-comparison
+#| fig-cap: "Point differential → win/loss accuracy — all regressors vs Vegas baseline."
+
+reg_names  = list(results_reg.keys())
+reg_accs   = [results_reg[m]["Test Acc (game)"] for m in reg_names]
+reg_maes   = [results_reg[m]["Test MAE (pts)"] for m in reg_names]
+
+colors_reg = [BLUE, TEAL, AMBER, PURPLE, GREEN]
+
+fig = make_subplots(rows=1, cols=2,
+                    subplot_titles=["Win/loss accuracy (converted from margin)",
+                                    "Point differential MAE (lower = better)"])
+
+fig.add_trace(go.Bar(
+    x=reg_names, y=reg_accs,
+    marker_color=colors_reg, marker_line_width=0,
+    text=[f"{v:.3f}" for v in reg_accs],
+    textposition="outside", textfont=dict(size=10),
+    showlegend=False), row=1, col=1)
+
+fig.add_hline(y=vegas_acc, line_dash="dot", line_color=RED, line_width=1.5,
+              annotation_text=f"Vegas {vegas_acc:.3f}",
+              annotation_font_color=RED, annotation_position="top right",
+              row=1, col=1)
+
+fig.add_trace(go.Bar(
+    x=reg_names, y=reg_maes,
+    marker_color=colors_reg, marker_line_width=0,
+    text=[f"{v:.2f}" for v in reg_maes],
+    textposition="outside", textfont=dict(size=10),
+    showlegend=False), row=1, col=2)
+
+fig.update_xaxes(tickangle=-20, tickfont=dict(size=10))
+fig.update_yaxes(title_text="Test accuracy", tickformat=".0%",
+                 range=[min(reg_accs) - 0.04, max(reg_accs) + 0.06], row=1, col=1)
+fig.update_yaxes(title_text="MAE (points)", row=1, col=2)
+fig.update_layout(height=440, margin=dict(l=48, r=24, t=56, b=64),
+                  paper_bgcolor="white", plot_bgcolor="white",
+                  font=dict(family="Inter, system-ui, sans-serif", size=12))
+fig.show()
+```
+
+## 10. Select best non-vegas model
+
+The model with the highest test accuracy across **both** classification and
+point-differential tables is selected as the non-vegas champion for downstream
+projections and cap analysis.
+
+```{python}
+#| label: select-best-noveg
+#| code-summary: "Select best non-vegas model"
+
+# Map model names to their fitted objects and scalers for downstream use
+cls_model_map = {
+    "XGBoost":              (xgb_cls,   None),
+    "Random Forest":        (rf_cls,    None),
+    "Logistic Regression":  (lr_cls,    scaler_cls),
+    "Ridge Classifier":     (ridge_cls, scaler_cls),
+    "Neural Network (MLP)": (mlp_cls,   scaler_mlp),
+}
+reg_model_map = {
+    "XGBoost Regressor":    (xgb_reg,   None),
+    "Random Forest Reg":    (rf_reg,    None),
+    "OLS":                  (ols_reg,   scaler_reg),
+    "Ridge Regression":     (ridge_reg, scaler_reg),
+    "Neural Network (MLP)": (mlp_reg,   scaler_mlp),
+}
+
+all_noveg = {}
+for name, res in results_cls.items():
+    mdl, scl = cls_model_map[name]
+    all_noveg[f"[CLS] {name}"] = {
+        "acc": res["Test Acc (game)"],
+        "pred": res["_pred"],
+        "prob": res.get("_prob"),
+        "type": "classifier",
+        "_model": mdl,
+        "_scaler": scl,
+        "_features": FEATURES,
+        "_has_proba": True,
+    }
+for name, res in results_reg.items():
+    mdl, scl = reg_model_map[name]
+    all_noveg[f"[REG] {name}"] = {
+        "acc": res["Test Acc (game)"],
+        "pred": res["_pred"],
+        "prob": None,
+        "type": "regressor",
+        "_model": mdl,
+        "_scaler": scl,
+        "_features": FEATURES,
+        "_has_proba": False,
+    }
+
+best_noveg_name = max(all_noveg, key=lambda k: all_noveg[k]["acc"])
+best_noveg      = all_noveg[best_noveg_name]
+
+print(f"Best non-vegas model: {best_noveg_name}")
+print(f"Test accuracy:        {best_noveg['acc']:.4f}")
+print(f"vs Vegas:             {best_noveg['acc'] - vegas_acc:+.4f}")
+```
+
+---
+
+# Part IV — Vegas-Augmented Model Suite
+
+::: {.callout-warning}
+**Why include a vegas model?** The original model is built without market data
+because the *purpose* of the project is to see how well publicly available team
+performance metrics can predict outcomes — using vegas lines is, in a sense,
+"cheating" since the spread already aggregates information from sharp bettors.
+That said, adding the spread as a feature is a legitimate benchmarking exercise:
+it shows the accuracy ceiling when market information is available, and the SHAP
+collinearity analysis below reveals which of our performance features become
+redundant once the market's information is included.
+:::
+
+## 11. Vegas model suite — win / loss classification
+
+```{python}
+#| label: train-classifiers-vegas
+#| code-summary: "Train all classifiers with vegas features — CV-tuned params, OOT early stopping"
+
+# Vegas CV search — same grid, same WF folds, but over FEATURES_VEGAS
+def wf_cv_score_v(feat, model_fn, param_dict):
+    return wf_cv_score(feat, FEATURES_VEGAS, model_fn, param_dict)
+
+print("XGBoost (vegas) CV search …")
+best_xgb_v_params, best_xgb_v_score = None, -1
+for p in xgb_grid:
+    sc = wf_cv_score_v(feat, _xgb_cls_factory, p)
+    if sc > best_xgb_v_score:
+        best_xgb_v_score, best_xgb_v_params = sc, p
+print(f"  best: depth={best_xgb_v_params[0]}, lr={best_xgb_v_params[1]}  →  CV={best_xgb_v_score:.4f}")
+
+print("RF (vegas) CV search …")
+best_rf_v_params, best_rf_v_score = None, -1
+for p in rf_grid:
+    sc = wf_cv_score_v(feat, _rf_cls_factory, p)
+    if sc > best_rf_v_score:
+        best_rf_v_score, best_rf_v_params = sc, p
+print(f"  best: depth={best_rf_v_params[0]}, min_leaf={best_rf_v_params[1]}  →  CV={best_rf_v_score:.4f}")
+
+print("Logistic (vegas) CV search …")
+best_lr_v_C, best_lr_v_score = None, -1
+for c in lr_C_grid:
+    sc = wf_cv_score_v(feat, _lr_cls_factory, (c,))
+    if sc > best_lr_v_score:
+        best_lr_v_score, best_lr_v_C = sc, c
+print(f"  best C={best_lr_v_C}  →  CV={best_lr_v_score:.4f}")
+
+print("Ridge (vegas) CV search …")
+best_ridge_v_alpha, best_ridge_v_score = None, -1
+for a in ridge_alpha_grid:
+    sc = wf_cv_score_v(feat, _ridge_cls_factory, (a,))
+    if sc > best_ridge_v_score:
+        best_ridge_v_score, best_ridge_v_alpha = sc, a
+print(f"  best alpha={best_ridge_v_alpha}  →  CV={best_ridge_v_score:.4f}")
+
+print("MLP (vegas) CV search …")
+best_mlp_v_params, best_mlp_v_score = None, -1
+for p in mlp_grid:
+    sc = wf_cv_score_v(feat, _mlp_cls_factory, p)
+    if sc > best_mlp_v_score:
+        best_mlp_v_score, best_mlp_v_params = sc, p
+print(f"  best hidden_layers={best_mlp_v_params[0]}, alpha={best_mlp_v_params[1]}"
+      f"  →  CV acc={best_mlp_v_score:.4f}")
+
+# Final training
+scaler_cls_v = StandardScaler()
+X_train_sc_v = scaler_cls_v.fit_transform(X_train_v)
+X_test_sc_v  = scaler_cls_v.transform(X_test_v)
+
+xgb_cls_v = XGBClassifier(
+    n_estimators=600, max_depth=best_xgb_v_params[0],
+    learning_rate=best_xgb_v_params[1], subsample=best_xgb_v_params[2],
+    colsample_bytree=0.6, min_child_weight=15,
+    reg_alpha=1.0, reg_lambda=5.0, gamma=1.0,
+    random_state=42, eval_metric="logloss", early_stopping_rounds=40, verbosity=0)
+xgb_cls_v.fit(X_train_v, y_train_cls,
+              eval_set=[(X_oot_v, y_oot_cls_v)], verbose=False)
+
+rf_cls_v = RandomForestClassifier(
+    n_estimators=500, max_depth=best_rf_v_params[0],
+    min_samples_leaf=best_rf_v_params[1],
+    max_features="sqrt", random_state=42, n_jobs=-1)
+rf_cls_v.fit(X_train_v, y_train_cls)
+
+lr_cls_v = LogisticRegression(C=best_lr_v_C, max_iter=1000, random_state=42)
+lr_cls_v.fit(X_train_sc_v, y_train_cls)
+
+ridge_cls_v = RidgeClassifier(alpha=best_ridge_v_alpha)
+ridge_cls_v.fit(X_train_sc_v, y_train_cls)
+
+scaler_mlp_v = StandardScaler()
+X_train_mlp_v = scaler_mlp_v.fit_transform(X_train_v)
+X_test_mlp_v  = scaler_mlp_v.transform(X_test_v)
+
+mlp_cls_v = MLPClassifier(
+    hidden_layer_sizes=best_mlp_v_params[0], alpha=best_mlp_v_params[1],
+    activation="relu", solver="adam",
+    max_iter=500, random_state=42,
+    early_stopping=True, validation_fraction=0.12,
+    n_iter_no_change=20, tol=1e-4)
+mlp_cls_v.fit(X_train_mlp_v, y_train_cls)
+print(f"MLP (vegas) trained: {len(mlp_cls_v.loss_curve_)} iterations | "
+      f"best val loss={min(mlp_cls_v.validation_scores_):.4f}")
+
+results_cls_v = {
+    "XGBoost (vegas)":             cls_metrics(xgb_cls_v,   X_train_v,    X_test_v,
+                                              y_train_cls, y_test_cls, test_df_ref=test_df_ref),
+    "Random Forest (vegas)":       cls_metrics(rf_cls_v,    X_train_v,    X_test_v,
+                                              y_train_cls, y_test_cls, test_df_ref=test_df_ref),
+    "Logistic Regression (vegas)": cls_metrics(lr_cls_v,    X_train_sc_v, X_test_sc_v,
+                                              y_train_cls, y_test_cls, scaled=True,
+                                              test_df_ref=test_df_ref),
+    "Ridge Classifier (vegas)":    cls_metrics(ridge_cls_v, X_train_sc_v, X_test_sc_v,
+                                              y_train_cls, y_test_cls,
+                                              scaled=True, is_ridge=True,
+                                              test_df_ref=test_df_ref),
+    "Neural Network (MLP) (vegas)": cls_metrics(mlp_cls_v, X_train_mlp_v, X_test_mlp_v,
+                                                y_train_cls, y_test_cls,
+                                                test_df_ref=test_df_ref),
+}
+
+tbl_v = pd.DataFrame({k: {c: v[c] for c in display_cols}
+                       for k, v in results_cls_v.items()}).T
+tbl_v.index.name = "Model"
+tbl_v["vs Vegas"] = (tbl_v["Test Acc (game)"].astype(float) - vegas_acc_game).round(4)
+print(f"Vegas — game-level: {vegas_acc_game:.4f}\n")
+print(tbl_v.to_string())
+```
+
+## 12. Vegas model suite — point differential regression
+
+```{python}
+#| label: train-regressors-vegas
+#| code-summary: "Train all regressors with vegas features — CV-tuned params, OOT early stopping"
+
+def wf_cv_score_reg_v(feat, model_fn, param_dict):
+    return wf_cv_score_reg(feat, FEATURES_VEGAS, model_fn, param_dict)
+
+print("XGBoost Regressor (vegas) CV search …")
+best_xgb_rv_params, best_xgb_rv_mae = None, np.inf
+for p in xgb_grid:
+    mae = wf_cv_score_reg_v(feat, _xgb_reg_factory, p)
+    if mae < best_xgb_rv_mae:
+        best_xgb_rv_mae, best_xgb_rv_params = mae, p
+print(f"  best: depth={best_xgb_rv_params[0]}, lr={best_xgb_rv_params[1]}  →  MAE={best_xgb_rv_mae:.3f}")
+
+print("RF Regressor (vegas) CV search …")
+best_rf_rv_params, best_rf_rv_mae = None, np.inf
+for p in rf_grid:
+    mae = wf_cv_score_reg_v(feat, _rf_reg_factory, p)
+    if mae < best_rf_rv_mae:
+        best_rf_rv_mae, best_rf_rv_params = mae, p
+print(f"  best: depth={best_rf_rv_params[0]}, min_leaf={best_rf_rv_params[1]}  →  MAE={best_rf_rv_mae:.3f}")
+
+print("Ridge Regressor (vegas) CV search …")
+best_ridge_rv_alpha, best_ridge_rv_mae = None, np.inf
+for a in ridge_alpha_grid:
+    mae = wf_cv_score_reg_v(feat, _ridge_reg_factory, (a,))
+    if mae < best_ridge_rv_mae:
+        best_ridge_rv_mae, best_ridge_rv_alpha = mae, a
+print(f"  best alpha={best_ridge_rv_alpha}  →  MAE={best_ridge_rv_mae:.3f}")
+
+# Final training
+scaler_reg_v = StandardScaler()
+X_train_sc_rv = scaler_reg_v.fit_transform(X_train_v)
+X_test_sc_rv  = scaler_reg_v.transform(X_test_v)
+
+xgb_reg_v = XGBRegressor(
+    n_estimators=600, max_depth=best_xgb_rv_params[0],
+    learning_rate=best_xgb_rv_params[1], subsample=best_xgb_rv_params[2],
+    colsample_bytree=0.6, min_child_weight=15,
+    reg_alpha=1.0, reg_lambda=5.0, gamma=1.0,
+    random_state=42, eval_metric="rmse", early_stopping_rounds=40, verbosity=0)
+xgb_reg_v.fit(X_train_v, y_train_reg,
+              eval_set=[(X_oot_v, y_oot_reg_v)], verbose=False)
+
+rf_reg_v = RandomForestRegressor(
+    n_estimators=500, max_depth=best_rf_rv_params[0],
+    min_samples_leaf=best_rf_rv_params[1],
+    max_features="sqrt", random_state=42, n_jobs=-1)
+rf_reg_v.fit(X_train_v, y_train_reg)
+
+ols_reg_v = LinearRegression()
+ols_reg_v.fit(X_train_sc_rv, y_train_reg)
+
+ridge_reg_v = Ridge(alpha=best_ridge_rv_alpha)
+ridge_reg_v.fit(X_train_sc_rv, y_train_reg)
+
+mlp_reg_v = MLPRegressor(
+    hidden_layer_sizes=best_mlp_v_params[0], alpha=best_mlp_v_params[1],
+    activation="relu", solver="adam",
+    max_iter=500, random_state=42,
+    early_stopping=True, validation_fraction=0.12,
+    n_iter_no_change=20, tol=1e-4)
+mlp_reg_v.fit(X_train_mlp_v, y_train_reg)
+print(f"MLP Regressor (vegas) trained: {len(mlp_reg_v.loss_curve_)} iterations")
+
+results_reg_v = {
+    "XGBoost Regressor (vegas)": reg_metrics(xgb_reg_v,   X_train_v,     X_test_v,
+                                             y_train_cls, y_test_cls, y_train_reg, y_test_reg,
+                                             test_df_ref=test_df_ref),
+    "Random Forest Reg (vegas)": reg_metrics(rf_reg_v,    X_train_v,     X_test_v,
+                                             y_train_cls, y_test_cls, y_train_reg, y_test_reg,
+                                             test_df_ref=test_df_ref),
+    "OLS (vegas)":               reg_metrics(ols_reg_v,   X_train_sc_rv, X_test_sc_rv,
+                                             y_train_cls, y_test_cls, y_train_reg, y_test_reg,
+                                             test_df_ref=test_df_ref),
+    "Ridge Regression (vegas)":  reg_metrics(ridge_reg_v, X_train_sc_rv, X_test_sc_rv,
+                                             y_train_cls, y_test_cls, y_train_reg, y_test_reg,
+                                             test_df_ref=test_df_ref),
+    "Neural Network (MLP) (vegas)": reg_metrics(mlp_reg_v, X_train_mlp_v, X_test_mlp_v,
+                                                y_train_cls, y_test_cls, y_train_reg, y_test_reg,
+                                                test_df_ref=test_df_ref),
+}
+
+tbl_reg_v = pd.DataFrame({k: {c: v[c] for c in reg_display_cols}
+                           for k, v in results_reg_v.items()}).T
+tbl_reg_v.index.name = "Model"
+tbl_reg_v["vs Vegas"] = (tbl_reg_v["Test Acc (game)"].astype(float) - vegas_acc_game).round(4)
+print(f"Vegas — game-level: {vegas_acc_game:.4f}\n")
+print(tbl_reg_v.to_string())
+```
+
+```{python}
+#| label: fig-vegas-vs-noveg
+#| fig-cap: "Non-vegas vs vegas model accuracy. Each pair shows the accuracy lift from including market data."
+
+# Best from each family (cls + reg) for both vegas/non-vegas
+comparison_data = []
+for name, res in results_cls.items():
+    vname = f"{name} (vegas)"
+    if vname in results_cls_v:
+        comparison_data.append({
+            "Model": name, "Type": "Classifier",
+            "No Vegas": res["Test Acc (game)"],
+            "Vegas": results_cls_v[vname]["Test Acc (game)"]
+        })
+for name, res in results_reg.items():
+    vname = f"{name} (vegas)"
+    if vname in results_reg_v:
+        comparison_data.append({
+            "Model": name.replace(" Regressor","").replace(" Reg",""),
+            "Type": "Regressor",
+            "No Vegas": res["Test Acc (game)"],
+            "Vegas": results_reg_v[vname]["Test Acc (game)"]
+        })
+
+comp_df = pd.DataFrame(comparison_data)
+
+fig = go.Figure()
+fig.add_trace(go.Bar(
+    name="No vegas", x=comp_df["Model"], y=comp_df["No Vegas"],
+    marker_color=BLUE, marker_line_width=0, opacity=0.85,
+    text=[f"{v:.3f}" for v in comp_df["No Vegas"]],
+    textposition="outside", textfont=dict(size=9)))
+fig.add_trace(go.Bar(
+    name="With vegas", x=comp_df["Model"], y=comp_df["Vegas"],
+    marker_color=TEAL, marker_line_width=0, opacity=0.85,
+    text=[f"{v:.3f}" for v in comp_df["Vegas"]],
+    textposition="outside", textfont=dict(size=9)))
+fig.add_hline(y=vegas_acc, line_dash="dot", line_color=RED, line_width=1.5,
+              annotation_text=f"Vegas spread {vegas_acc:.3f}",
+              annotation_font_color=RED, annotation_position="top right")
+
+fig.update_layout(
+    barmode="group", showlegend=True,
+    legend=dict(x=0.01, y=0.98),
+    xaxis_title=None,
+    yaxis=dict(title="Test accuracy (2025 W1–17)", tickformat=".0%",
+               range=[0, comp_df[["No Vegas","Vegas"]].max().max() + 0.06]))
+clean_fig(fig, height=440).show()
+```
+
+## 13. Select best vegas model
+
+```{python}
+#| label: select-best-vegas
+#| code-summary: "Select best vegas model"
+
+cls_model_map_v = {
+    "XGBoost (vegas)":              (xgb_cls_v,   None),
+    "Random Forest (vegas)":        (rf_cls_v,    None),
+    "Logistic Regression (vegas)":  (lr_cls_v,    scaler_cls_v),
+    "Ridge Classifier (vegas)":     (ridge_cls_v, scaler_cls_v),
+    "Neural Network (MLP) (vegas)": (mlp_cls_v,   scaler_mlp_v),
+}
+reg_model_map_v = {
+    "XGBoost Regressor (vegas)":    (xgb_reg_v,   None),
+    "Random Forest Reg (vegas)":    (rf_reg_v,    None),
+    "OLS (vegas)":                  (ols_reg_v,   scaler_reg_v),
+    "Ridge Regression (vegas)":     (ridge_reg_v, scaler_reg_v),
+    "Neural Network (MLP) (vegas)": (mlp_reg_v,   scaler_mlp_v),
+}
+
+all_veg = {}
+for name, res in results_cls_v.items():
+    mdl, scl = cls_model_map_v[name]
+    all_veg[f"[CLS] {name}"] = {
+        "acc": res["Test Acc (game)"],
+        "pred": res["_pred"],
+        "prob": res.get("_prob"),
+        "type": "classifier",
+        "_model": mdl,
+        "_scaler": scl,
+        "_features": FEATURES_VEGAS,
+        "_has_proba": True,
+    }
+for name, res in results_reg_v.items():
+    mdl, scl = reg_model_map_v[name]
+    all_veg[f"[REG] {name}"] = {
+        "acc": res["Test Acc (game)"],
+        "pred": res["_pred"],
+        "prob": None,
+        "type": "regressor",
+        "_model": mdl,
+        "_scaler": scl,
+        "_features": FEATURES_VEGAS,
+        "_has_proba": False,
+    }
+
+best_veg_name = max(all_veg, key=lambda k: all_veg[k]["acc"])
+best_veg      = all_veg[best_veg_name]
+
+print(f"Best vegas model:  {best_veg_name}")
+print(f"Test accuracy:     {best_veg['acc']:.4f}")
+print(f"vs Vegas spread:   {best_veg['acc'] - vegas_acc:+.4f}")
+print(f"\nBest non-vegas:    {best_noveg_name}  ({best_noveg['acc']:.4f})")
+print(f"Accuracy lift:     {best_veg['acc'] - best_noveg['acc']:+.4f}")
+```
+
+## 14. SHAP collinearity analysis — vegas features
+
+When spread and total line are added to the feature set, some performance
+metrics become redundant — the market has already priced them in. The SHAP
+bar chart below shows which features retain independent importance after
+vegas lines are included, and which drop toward zero.
+
+VIF (Variance Inflation Factor) quantifies linear multicollinearity between
+features. A VIF > 10 indicates strong collinearity; values between 5–10 are
+moderate. Features with high VIF after adding vegas lines are the ones the
+market most efficiently encodes.
+
+```{python}
+#| label: shap-vegas
+#| code-summary: "SHAP + VIF for best vegas classifier"
+
+import shap
+from statsmodels.stats.outliers_influence import variance_inflation_factor
+
+# ── SHAP (on XGBoost vegas model for interpretability) ───────────────────────
+xgb_for_shap = xgb_cls_v  # XGBoost always used for SHAP regardless of best model
+
+explainer_v   = shap.TreeExplainer(xgb_for_shap)
+rng           = np.random.RandomState(42)
+idx_v         = rng.choice(len(X_train_v), min(800, len(X_train_v)), replace=False)
+shap_vals_v   = explainer_v.shap_values(X_train_v.iloc[idx_v])
+feat_vals_v   = X_train_v.iloc[idx_v].values
+
+mean_shap_v = (pd.Series(np.abs(shap_vals_v).mean(0), index=FEATURES_VEGAS)
+               .sort_values(ascending=False))
+
+# ── VIF ───────────────────────────────────────────────────────────────────────
+X_vif = X_train_v.copy().fillna(X_train_v.median())
+vif_data = pd.DataFrame({
+    "Feature": FEATURES_VEGAS,
+    "VIF": [variance_inflation_factor(X_vif.values, i)
+            for i in range(X_vif.shape[1])]
+}).sort_values("VIF", ascending=False)
+
+print("Top 15 features by VIF (vegas model):")
+print(vif_data.head(15).to_string(index=False))
+```
+
+```{python}
+#| label: fig-shap-vegas-bar
+#| fig-cap: "SHAP mean |value| per feature — vegas model. Vegas features (spread/total) highlighted in red."
+
+top_n = 30
+top_feats = mean_shap_v.head(top_n)
+
+bar_colors = []
+for f in top_feats.index:
+    if f in ["spread_line_team", "total_line"]:
+        bar_colors.append(RED)
+    elif mean_shap_v[f] >= mean_shap_v.quantile(0.75):
+        bar_colors.append(BEARS)
+    else:
+        bar_colors.append(SLATE)
+
+fig = go.Figure(go.Bar(
+    x=top_feats.values[::-1],
+    y=top_feats.index[::-1],
+    orientation="h",
+    marker_color=bar_colors[::-1],
+    marker_line_width=0,
+    text=top_feats.values[::-1].round(4).astype(str),
+    textposition="outside", textfont=dict(size=9)))
+
+fig.add_annotation(
+    x=0.98, y=0.02, xref="paper", yref="paper", showarrow=False,
+    text="<b style='color:#DC2626'>■</b> Vegas features  "
+         "<b style='color:#0B162A'>■</b> High importance  "
+         "<b style='color:#94A3B8'>■</b> Lower importance",
+    font=dict(size=10), align="right")
+
+fig.update_layout(xaxis_title="Mean |SHAP value|", yaxis_title=None)
+clean_fig(fig, height=700, margin=dict(l=230, r=80, t=32, b=48)).show()
+```
+
+```{python}
+#| label: fig-shap-beeswarm-vegas
+#| fig-cap: "SHAP beeswarm — vegas model (top 25 features). Red = high feature value, blue = low."
+
+top25 = mean_shap_v.head(25).index.tolist()
+feat_idx_v = {f: i for i, f in enumerate(FEATURES_VEGAS)}
+rng2 = np.random.RandomState(0)
+
+def norm_to_rgb(v):
+    r = int(220 * v + 37 * (1 - v))
+    g_c = int(38  * v + 99 * (1 - v))
+    b = int(38  * v + 235* (1 - v))
+    return f"rgb({r},{g_c},{b})"
+
+fig = go.Figure()
+for yi, feat_name in enumerate(reversed(top25)):
+    fi  = feat_idx_v[feat_name]
+    sv  = shap_vals_v[:, fi]
+    fv  = feat_vals_v[:, fi]
+    fv_min, fv_max = np.nanpercentile(fv, 5), np.nanpercentile(fv, 95)
+    fv_norm  = np.where(np.isnan(fv), 0.5,
+                   np.clip((fv - fv_min) / (fv_max - fv_min + 1e-9), 0, 1))
+    dot_colors = [norm_to_rgb(v) for v in fv_norm]
+    y_jitter   = yi + rng2.uniform(-0.35, 0.35, size=len(sv))
+
+    border_color = RED if feat_name in ["spread_line_team","total_line"] else None
+
+    fig.add_trace(go.Scatter(
+        x=sv, y=y_jitter, mode="markers",
+        marker=dict(size=4, color=dot_colors, opacity=0.65, line=dict(width=0)),
+        name=feat_name, showlegend=False,
+        hovertemplate=f"<b>{feat_name}</b><br>SHAP: %{{x:.4f}}<extra></extra>"))
+
+fig.add_vline(x=0, line_color=BORDER, line_width=1.5)
+fig.update_layout(
+    xaxis=dict(title="SHAP value (impact on win probability)", zeroline=False),
+    yaxis=dict(
+        tickvals=list(range(len(top25))),
+        ticktext=list(reversed(top25)),
+        tickfont=dict(size=10)),
+    height=680,
+    margin=dict(l=230, r=40, t=48, b=48),
+    paper_bgcolor="white", plot_bgcolor="white",
+    font=dict(family="Inter, system-ui, sans-serif", size=12, color="#1E293B"))
+fig.update_xaxes(showgrid=True, gridcolor=BORDER, zeroline=True,
+                 zerolinecolor=SLATE, zerolinewidth=1.5)
+fig.update_yaxes(showgrid=False)
+fig.show()
+```
+
+```{python}
+#| label: fig-vif-bar
+#| fig-cap: "VIF scores for vegas feature set. Features with VIF > 10 have strong linear collinearity."
+
+top_vif = vif_data.head(20).sort_values("VIF")
+
+vif_colors = []
+for _, row in top_vif.iterrows():
+    if row["Feature"] in ["spread_line_team","total_line"]:
+        vif_colors.append(RED)
+    elif row["VIF"] > 10:
+        vif_colors.append(AMBER)
+    else:
+        vif_colors.append(BLUE)
+
+fig = go.Figure(go.Bar(
+    x=top_vif["VIF"], y=top_vif["Feature"],
+    orientation="h",
+    marker_color=vif_colors, marker_line_width=0,
+    text=top_vif["VIF"].round(1).astype(str),
+    textposition="outside", textfont=dict(size=10)))
+
+fig.add_vline(x=10, line_dash="dot", line_color=AMBER, line_width=1.5,
+              annotation_text="VIF = 10 threshold",
+              annotation_font_color=AMBER, annotation_position="top right")
+fig.add_vline(x=5,  line_dash="dot", line_color=SLATE, line_width=1,
+              annotation_text="VIF = 5",
+              annotation_font_color=SLATE, annotation_position="bottom right")
+
+fig.update_layout(xaxis_title="Variance Inflation Factor", yaxis_title=None)
+clean_fig(fig, height=520, margin=dict(l=230, r=80, t=32, b=48)).show()
+```
+
+::: {.callout-note}
+**Reading the SHAP + VIF collinearity section.** Two complementary signals:
+
+- **SHAP drops to near zero** — the feature no longer adds predictive value once
+  the spread is in the model. The market has already priced it in.
+- **VIF rises** — the feature is linearly correlated with one or more others.
+  High VIF after adding vegas lines tells us which performance metrics the spread
+  is essentially summarising.
+
+Features that retain high SHAP *and* low VIF even after adding vegas lines are
+the ones our performance model contributes that the market is not fully pricing —
+these are the most analytically interesting for a front office.
+:::
+
+---
+
+# Part V — 2025 Season Projections
+
+## 15. How projections update each week
+
+The projected win total for each team is:
+
+$$\text{Projected wins} = \text{Actual wins so far} + \sum_{\text{remaining games}} P(\text{win}_i)$$
+
+::: {.callout-note}
+**Monte Carlo uncertainty intervals.**  
+Win probabilities are point estimates, not certainties. To quantify how much a
+team's final win total could plausibly vary, we run 5,000 Monte Carlo simulations
+of the remaining schedule for each team. Each simulation draws a Bernoulli
+outcome for every remaining game using the model's predicted probability. The
+10th and 90th percentiles of simulated final win totals form the uncertainty band
+reported alongside each point projection. Wider bands indicate a team with many
+close games (high variance); narrower bands indicate decisive mismatches.
+:::
+
+```{python}
+#| label: project-2025-noveg
+#| code-summary: "2025 projections with Monte Carlo 80% intervals"
+
+N_SIM = 5_000
+RNG   = np.random.default_rng(42)
+
+def get_model_preds_2025(feat, features, best_info, scaler=None):
+    """
+    Generate win probabilities for 2025 games using the selected best model.
+    Returns a copy of the 2025 slice with win_prob added.
+    """
+    games_2025  = feat[feat["season"] == 2025].copy()
+    played_2025 = games_2025[games_2025["win"].notna()].copy()
+    X_25 = played_2025[features].fillna(
+        feat.loc[feat["season"].between(2018,2024), features].median())
+
+    if scaler is not None:
+        X_25 = scaler.transform(X_25)
+
+    if best_info["prob"] is not None:
+        played_2025["win_prob"] = best_info["_model"].predict_proba(X_25)[:, 1]
+    else:
+        raw = best_info["_model"].predict(X_25)
+        played_2025["win_prob"] = 1 / (1 + np.exp(-raw / raw.std()))
+    return played_2025
+
+def build_projections(feat, features, model_name, model_obj,
+                       has_proba=True, scaler=None):
+    games_2025  = feat[feat["season"] == 2025].copy()
+    played_2025 = games_2025[games_2025["win"].notna()].copy()
+    X_25 = played_2025[features].fillna(
+        feat.loc[feat["season"].between(2018,2024), features].median())
+    X_25_inp = scaler.transform(X_25) if scaler is not None else X_25.values
+
+    if has_proba:
+        played_2025["win_prob"] = model_obj.predict_proba(X_25_inp)[:, 1]
+    else:
+        raw = model_obj.predict(X_25_inp)
+        played_2025["win_prob"] = 1 / (1 + np.exp(-(raw - raw.mean()) / (raw.std() + 1e-9)))
+
+    all_teams = sorted(played_2025["team"].unique())
+    max_week  = int(played_2025["week"].max())
+    proj_rows = []
+    for pw in range(1, max_week + 2):
+        for team in all_teams:
+            tg     = played_2025[played_2025["team"] == team]
+            past   = tg[tg["week"] < pw]
+            future = tg[tg["week"] >= pw]
+
+            actual_w = past["win"].sum() if len(past) > 0 else 0
+            exp_w    = (actual_w
+                        + (future["win_prob"].sum() if len(future) > 0 else 0))
+
+            # Monte Carlo: simulate remaining games N_SIM times
+            if len(future) > 0:
+                probs = future["win_prob"].values          # shape (n_remaining,)
+                draws = RNG.random((N_SIM, len(probs)))    # (n_sim, n_remaining)
+                sim_wins = (draws < probs).sum(axis=1) + actual_w
+                lo_80 = float(np.percentile(sim_wins, 10))
+                hi_80 = float(np.percentile(sim_wins, 90))
+            else:
+                lo_80 = hi_80 = float(actual_w)
+
+            proj_rows.append({
+                "proj_week":       pw,
+                "team":            team,
+                "actual_wins":     actual_w,
+                "games_played":    len(past),
+                "proj_total_wins": exp_w,
+                "ci_lo_80":        lo_80,
+                "ci_hi_80":        hi_80,
+            })
+    return pd.DataFrame(proj_rows), played_2025
+
+proj_noveg, played_2025_noveg = build_projections(
+    feat, FEATURES, "Best non-vegas",
+    xgb_cls, has_proba=True, scaler=None)
+
+proj_veg, played_2025_veg = build_projections(
+    feat, FEATURES_VEGAS, "Best vegas",
+    xgb_cls_v, has_proba=True, scaler=None)
+
+def preseason_mae(proj_df, played_2025):
+    final_actual = (played_2025.groupby("team")["win"].sum()
+                    .reset_index().rename(columns={"win":"actual_final"}))
+    pre = (proj_df[proj_df["proj_week"] == 1]
+           .merge(final_actual, on="team")
+           .assign(error=lambda x: (x["proj_total_wins"] - x["actual_final"]).abs()))
+    return pre, pre["error"].mean()
+
+pre_noveg, mae_noveg = preseason_mae(proj_noveg, played_2025_noveg)
+pre_veg,   mae_veg   = preseason_mae(proj_veg,   played_2025_veg)
+
+print(f"Non-vegas preseason MAE: {mae_noveg:.2f} wins")
+print(f"Vegas preseason MAE:     {mae_veg:.2f} wins")
+```
+
+```{python}
+#| label: fig-preseason-dual
+#| fig-cap: "Preseason projected vs actual 2025 wins — non-vegas (left) and vegas (right) best models."
+
+fig = make_subplots(rows=1, cols=2,
+                    subplot_titles=[f"Non-Vegas Best Model (MAE = {mae_noveg:.2f})",
+                                    f"Vegas Best Model (MAE = {mae_veg:.2f})"])
+
+for col_i, (pre_df, color_main) in enumerate([(pre_noveg, BLUE), (pre_veg, TEAL)], 1):
+    fig.add_trace(go.Scatter(x=[2, 16], y=[2, 16], mode="lines", hoverinfo="skip",
+        line=dict(color=SLATE, dash="dot", width=1.5), showlegend=False), row=1, col=col_i)
+    fig.add_trace(go.Scatter(
+        x=pre_df["proj_total_wins"], y=pre_df["actual_final"],
+        mode="markers+text", text=pre_df["team"],
+        textposition="top center", textfont=dict(size=8, color=SLATE),
+        marker=dict(size=8, line=dict(width=1, color="white"),
+            color=[BEARS if t=="CHI" else color_main for t in pre_df["team"]]),
+        hovertemplate="<b>%{text}</b><br>Proj: %{x:.1f}<br>Actual: %{y:.0f}<extra></extra>",
+        showlegend=False), row=1, col=col_i)
+
+fig.update_xaxes(title_text="Preseason projected wins", range=[3, 16])
+fig.update_yaxes(title_text="Actual 2025 wins", range=[1, 17], row=1, col=1)
+fig.update_layout(height=460, margin=dict(l=48, r=24, t=64, b=48),
+                  paper_bgcolor="white", plot_bgcolor="white",
+                  font=dict(family="Inter, system-ui, sans-serif", size=12))
+fig.show()
+```
+
+```{python}
+#| label: fig-current-proj-ci
+#| fig-cap: "Current-week projected final wins with 80% Monte Carlo intervals (non-vegas model). Bars sorted by projection; error bars show 10th–90th percentile over 5,000 simulations."
+
+# Pull the most recent projection week available
+max_pw_noveg = proj_noveg["proj_week"].max()
+cur = (proj_noveg[proj_noveg["proj_week"] == max_pw_noveg]
+       .sort_values("proj_total_wins", ascending=True)
+       .reset_index(drop=True))
+
+fig = go.Figure()
+
+# CI bars (behind)
+for _, row in cur.iterrows():
+    fig.add_trace(go.Scatter(
+        x=[row["proj_total_wins"], row["proj_total_wins"]],
+        y=[row["ci_lo_80"], row["ci_hi_80"]],
+        mode="lines",
+        line=dict(color=SLATE, width=6),
+        opacity=0.35,
+        showlegend=False,
+        hoverinfo="skip"))
+
+# Point estimates
+colors_ci = [BEARS if t == "CHI" else BLUE for t in cur["team"]]
+fig.add_trace(go.Scatter(
+    x=cur["proj_total_wins"],
+    y=cur["team"],
+    mode="markers+text",
+    marker=dict(size=10, color=colors_ci, line=dict(width=1, color="white")),
+    text=[f"{v:.1f}" for v in cur["proj_total_wins"]],
+    textposition="middle right",
+    textfont=dict(size=9),
+    hovertemplate="<b>%{y}</b><br>Proj: %{x:.1f} wins<br>"
+                  "80% CI: %{customdata[0]:.1f}–%{customdata[1]:.1f}<extra></extra>",
+    customdata=cur[["ci_lo_80","ci_hi_80"]].values,
+    showlegend=False))
+
+fig.update_layout(
+    xaxis=dict(title="Projected final wins", range=[0, 19],
+               showgrid=True, gridcolor=BORDER),
+    yaxis=dict(title=None, tickfont=dict(size=9)),
+    height=max(480, len(cur) * 16),
+    margin=dict(l=56, r=80, t=48, b=48),
+    paper_bgcolor="white", plot_bgcolor="white",
+    font=dict(family="Inter, system-ui, sans-serif", size=12, color="#1E293B"),
+    title=dict(
+        text=(f"Week {max_pw_noveg} Projections — 80% CI shown as grey bars  "
+              f"<span style='color:{BEARS}'>■ CHI</span>  "
+              f"<span style='color:{BLUE}'>■ other</span>"),
+        font=dict(size=12), x=0.0, xanchor="left"))
+fig.show()
+```
+
+```{python}
+#| label: fig-evolution-dual
+#| fig-cap: "Week-by-week projected win totals — non-vegas (top) and vegas (bottom). Dashed = actual."
+
+spotlight = {
+    "CHI": BEARS,   "DET": "#0076B6", "BUF": "#00338D",
+    "KC":  "#E31837","JAX": "#006778","NE":  "#002244", "DEN":"#FB4F14"
+}
+
+fig = make_subplots(rows=2, cols=1, shared_xaxes=True,
+                    subplot_titles=["Non-Vegas Best Model", "Vegas Best Model"],
+                    vertical_spacing=0.1)
+
+for row_i, (proj_df, played_2025) in enumerate(
+        [(proj_noveg, played_2025_noveg), (proj_veg, played_2025_veg)], 1):
+    max_week = int(played_2025["week"].max())
+    for team, color in spotlight.items():
+        td     = proj_df[proj_df["team"] == team].sort_values("proj_week")
+        actual = int(played_2025[played_2025["team"] == team]["win"].sum())
+        fig.add_trace(go.Scatter(
+            x=td["proj_week"], y=td["proj_total_wins"],
+            mode="lines+markers", name=team if row_i == 1 else None,
+            showlegend=(row_i == 1),
+            line=dict(color=color, width=2.2), marker=dict(size=3, color=color)),
+            row=row_i, col=1)
+        fig.add_trace(go.Scatter(
+            x=[1, max_week + 1], y=[actual, actual], mode="lines",
+            showlegend=False, line=dict(color=color, dash="dot", width=1)),
+            row=row_i, col=1)
+
+fig.update_xaxes(title_text="Projection made before week...", dtick=2, row=2, col=1)
+fig.update_yaxes(title_text="Projected wins", range=[2, 17])
+fig.update_layout(
+    height=700, margin=dict(l=48, r=24, t=72, b=48),
+    paper_bgcolor="white", plot_bgcolor="white",
+    font=dict(family="Inter, system-ui, sans-serif", size=12, color="#1E293B"),
+    showlegend=True,
+    legend=dict(x=0.01, y=0.99, bgcolor="rgba(255,255,255,0.85)", font=dict(size=10)))
+fig.show()
+```
+
+## 16. Week 18 diagnostic
+
+```{python}
+#| label: w18-diagnostic
+#| code-summary: "Week 18 evaluation for best non-vegas model"
+
+# Best non-vegas on Week 18 — MLP (best non-vegas model)
+X_w18_mlp  = scaler_mlp.transform(X_w18)
+y_prob_w18 = mlp_cls.predict_proba(X_w18_mlp)[:, 1]
+y_pred_w18 = (y_prob_w18 >= 0.5).astype(int)
+
+# Best test predictions (non-vegas) — MLP
+y_prob_test = mlp_cls.predict_proba(X_test_mlp)[:, 1]
+y_pred_test = (y_prob_test >= 0.5).astype(int)
+
+test_data = feat.loc[test_mask].copy()
+test_data["model_prob"] = y_prob_test
+test_data["model_pred"] = y_pred_test
+test_data["vegas_pred"] = (test_data["spread_line_team"] > 0).astype(int)
+
+w18_data = feat.loc[w18_mask].copy()
+w18_data["model_prob"] = y_prob_w18
+w18_data["model_pred"] = y_pred_w18
+w18_data["vegas_pred"] = (w18_data["spread_line_team"] > 0).astype(int)
+
+model_acc      = accuracy_score(y_test_cls, y_pred_test)
+model_acc_w18  = accuracy_score(y_w18, y_pred_w18)
+vegas_acc_w18  = accuracy_score(w18_data["win"], w18_data["vegas_pred"])
+
+print(f"Best non-vegas model (MLP) — W1-17 accuracy: {model_acc:.4f}")
+print(f"Best non-vegas model (MLP) — W18 accuracy:  {model_acc_w18:.4f}")
+print(f"Vegas W18 accuracy:                          {vegas_acc_w18:.4f}")
+```
+
+```{python}
+#| label: fig-w18-diagnostic
+#| fig-cap: "Week 18 2025: model accuracy by stakes status."
+
+w18_data["model_correct"] = (w18_data["model_pred"] == w18_data["win"]).astype(int)
+w18_data["vegas_correct"]  = (w18_data["vegas_pred"] == w18_data["win"]).astype(int)
+w18_data["stakes_label"]   = w18_data["game_low_stakes"].map(
+    {0: "Both teams\nplaying for something", 1: "At least one team\nclinched/eliminated"})
+
+stakes_grp = (w18_data.groupby("stakes_label")
+                       .agg(model_acc_grp=("model_correct","mean"),
+                            vegas_acc_grp=("vegas_correct","mean"),
+                            n=("win","count"))
+                       .reset_index())
+
+fig = go.Figure()
+fig.add_trace(go.Bar(
+    x=stakes_grp["stakes_label"], y=stakes_grp["model_acc_grp"],
+    name="Model", marker_color=BLUE, opacity=0.85,
+    text=(stakes_grp["model_acc_grp"]*100).round(1).astype(str)+"%",
+    textposition="outside"))
+fig.add_trace(go.Bar(
+    x=stakes_grp["stakes_label"], y=stakes_grp["vegas_acc_grp"],
+    name="Vegas", marker_color=AMBER, opacity=0.6,
+    text=(stakes_grp["vegas_acc_grp"]*100).round(1).astype(str)+"%",
+    textposition="outside"))
+fig.update_layout(barmode="group",
+    yaxis=dict(title="Accuracy", tickformat=".0%", range=[0, 1.1]),
+    showlegend=True, legend=dict(x=0.85, y=0.98))
+clean_fig(fig, height=400).show()
+```
+
+## 16b. SHAP feature importance — best non-vegas model
+
+Two complementary views: a **bar chart** (mean |SHAP| per feature, overall
+importance ranking) and a **beeswarm** (every training observation as a dot;
+colour = raw feature value; x-axis = SHAP value). Computed on the XGBoost
+classifier regardless of which model "won" the comparison, since XGBoost's
+`TreeExplainer` gives exact SHAP values.
+
+```{python}
+#| label: shap-noveg
+#| code-summary: "SHAP values — best non-vegas model (conditional on winner)"
+
+import shap as shap_lib
+
+# ── Determine which SHAP explainer to use based on best model ─────────────────
+# TreeExplainer: exact SHAP for XGBoost and Random Forest (fast, mathematically exact)
+# KernelExplainer: model-agnostic approximation for MLP and linear models
+#   - Uses a background dataset to estimate feature contributions
+#   - Slower than TreeExplainer; values are approximations not exact
+#   - Still produces valid beeswarm/bar interpretations for the presentation
+
+rng_nv    = np.random.RandomState(42)
+idx_nv    = rng_nv.choice(len(X_train), min(800, len(X_train)), replace=False)
+sample_nv = X_train.iloc[idx_nv]
+
+best_noveg_base = best_noveg_name.replace("[CLS] ", "").replace("[REG] ", "")
+
+if best_noveg_base in ("XGBoost", "Random Forest"):
+    mdl_for_shap = xgb_cls if best_noveg_base == "XGBoost" else rf_cls
+    explainer_nv = shap_lib.TreeExplainer(mdl_for_shap)
+    shap_vals_nv = explainer_nv.shap_values(sample_nv)
+    shap_method_label = f"TreeExplainer (exact) — {best_noveg_base}"
+
+elif best_noveg_base == "Neural Network (MLP)":
+    # KernelExplainer needs a small background set (median of training data)
+    # and a predict function that returns probabilities
+    background   = shap_lib.sample(X_train_mlp, 100, random_state=42)
+    sample_mlp   = scaler_mlp.transform(sample_nv)
+    explainer_nv = shap_lib.KernelExplainer(
+        lambda x: mlp_cls.predict_proba(x)[:, 1], background)
+    shap_vals_nv = explainer_nv.shap_values(sample_mlp, nsamples=200)
+    shap_method_label = "KernelExplainer (approximation) — Neural Network (MLP)"
+
+else:
+    # Linear models: use LinearExplainer (exact for linear models)
+    mdl_for_shap = lr_cls if "Logistic" in best_noveg_base else ridge_cls
+    masker       = shap_lib.maskers.Independent(X_train_sc)
+    explainer_nv = shap_lib.LinearExplainer(mdl_for_shap, masker)
+    sample_sc    = scaler_cls.transform(sample_nv)
+    shap_vals_nv = explainer_nv.shap_values(sample_sc)
+    shap_method_label = f"LinearExplainer (exact) — {best_noveg_base}"
+
+print(f"Best non-vegas model: {best_noveg_name}")
+print(f"SHAP method: {shap_method_label}")
+
+feat_vals_nv = sample_nv.values   # raw feature values for beeswarm colouring
+mean_shap_nv = (pd.Series(np.abs(shap_vals_nv).mean(0), index=FEATURES)
+                .sort_values(ascending=True))
+
+threshold_nv = mean_shap_nv.quantile(0.75)
+colours_nv   = [BEARS if v >= threshold_nv else SLATE for v in mean_shap_nv.values]
+
+fig = go.Figure(go.Bar(
+    x=mean_shap_nv.values, y=mean_shap_nv.index, orientation="h",
+    marker_color=colours_nv, marker_line_width=0,
+    text=mean_shap_nv.values.round(4).astype(str),
+    textposition="outside", textfont=dict(size=10)))
+fig.update_layout(
+    title=dict(text=f"SHAP Feature Importance — {best_noveg_base}<br>"
+                    f"<sup>{shap_method_label}</sup>",
+               font=dict(size=13)),
+    xaxis_title="Mean |SHAP value|", yaxis_title=None)
+clean_fig(fig, height=680, margin=dict(l=230, r=80, t=56, b=48)).show()
+```
+
+```{python}
+#| label: fig-shap-beeswarm-noveg
+#| fig-cap: "SHAP beeswarm — best non-vegas model. Red = high feature value, blue = low."
+
+sorted_feats_nv = mean_shap_nv.index.tolist()   # ascending importance order
+feat_idx_nv     = {f: i for i, f in enumerate(FEATURES)}
+rng_bee         = np.random.RandomState(0)
+
+def norm_to_rgb_bee(v):
+    r = int(220 * v + 37 * (1 - v))
+    g_c = int(38 * v + 99 * (1 - v))
+    b   = int(38 * v + 235 * (1 - v))
+    return f"rgb({r},{g_c},{b})"
+
+fig = go.Figure()
+for yi, feat_name in enumerate(sorted_feats_nv):
+    fi  = feat_idx_nv[feat_name]
+    sv  = shap_vals_nv[:, fi]
+    fv  = feat_vals_nv[:, fi]
+    fv_min, fv_max = np.nanpercentile(fv, 5), np.nanpercentile(fv, 95)
+    fv_norm  = np.where(np.isnan(fv), 0.5,
+                   np.clip((fv - fv_min) / (fv_max - fv_min + 1e-9), 0, 1))
+    dot_colors = [norm_to_rgb_bee(v) for v in fv_norm]
+    y_jitter   = yi + rng_bee.uniform(-0.35, 0.35, size=len(sv))
+
+    fig.add_trace(go.Scatter(
+        x=sv, y=y_jitter, mode="markers",
+        marker=dict(size=4, color=dot_colors, opacity=0.65, line=dict(width=0)),
+        name=feat_name, showlegend=False,
+        hovertemplate=(f"<b>{feat_name}</b><br>"
+                       "SHAP: %{x:.4f}<br>"
+                       f"Raw value: %{{customdata:.3f}}<extra></extra>"),
+        customdata=fv))
+
+fig.add_vline(x=0, line_color=BORDER, line_width=1.5)
+
+for val, label, xpos in [(0, "Low", 0.82), (1, "High", 0.97)]:
+    c = norm_to_rgb_bee(val)
+    fig.add_annotation(
+        x=xpos, y=1.01, xref="paper", yref="paper",
+        text=f"<b style='color:{c}'>{label}</b>",
+        showarrow=False, font=dict(size=11))
+fig.add_annotation(
+    x=0.895, y=1.01, xref="paper", yref="paper",
+    text="Feature value →", showarrow=False,
+    font=dict(size=10, color=SLATE))
+
+fig.update_layout(
+    xaxis=dict(title="SHAP value (impact on win probability)", zeroline=False),
+    yaxis=dict(
+        tickvals=list(range(len(sorted_feats_nv))),
+        ticktext=sorted_feats_nv,
+        tickfont=dict(size=10)),
+    height=720,
+    margin=dict(l=230, r=40, t=48, b=48),
+    paper_bgcolor="white", plot_bgcolor="white",
+    font=dict(family="Inter, system-ui, sans-serif", size=12, color="#1E293B"))
+fig.update_xaxes(showgrid=True, gridcolor=BORDER, zeroline=True,
+                 zerolinecolor=SLATE, zerolinewidth=1.5)
+fig.update_yaxes(showgrid=False)
+fig.show()
+```
+
+## 16b2. SHAP feature importance — Random Forest (non-vegas)
+
+```{python}
+#| label: shap-noveg-2nd
+#| code-summary: "SHAP values — Random Forest (non-vegas)"
+
+explainer_rf  = shap_lib.TreeExplainer(rf_cls)
+_shap_rf      = explainer_rf.shap_values(sample_nv)
+# Older SHAP returns a list [class_0, class_1]; newer returns a 3-D array (samples, features, classes)
+if isinstance(_shap_rf, list):
+    shap_vals_nv2 = _shap_rf[1]
+elif isinstance(_shap_rf, np.ndarray) and _shap_rf.ndim == 3:
+    shap_vals_nv2 = _shap_rf[:, :, 1]
+else:
+    shap_vals_nv2 = _shap_rf
+feat_vals_nv2 = sample_nv.values
+shap_method_label2 = "TreeExplainer (exact) — Random Forest"
+
+print(f"SHAP method: {shap_method_label2}")
+
+mean_shap_nv2   = (pd.Series(np.abs(shap_vals_nv2).mean(0), index=FEATURES)
+                   .sort_values(ascending=True))
+threshold_nv2   = mean_shap_nv2.quantile(0.75)
+colours_nv2     = [BEARS if v >= threshold_nv2 else SLATE for v in mean_shap_nv2.values]
+
+fig = go.Figure(go.Bar(
+    x=mean_shap_nv2.values, y=mean_shap_nv2.index, orientation="h",
+    marker_color=colours_nv2, marker_line_width=0,
+    text=mean_shap_nv2.values.round(4).astype(str),
+    textposition="outside", textfont=dict(size=10)))
+fig.update_layout(
+    title=dict(text=f"SHAP Feature Importance — Random Forest<br>"
+                    f"<sup>{shap_method_label2}</sup>",
+               font=dict(size=13)),
+    xaxis_title="Mean |SHAP value|", yaxis_title=None)
+clean_fig(fig, height=680, margin=dict(l=230, r=80, t=56, b=48)).show()
+```
+
+```{python}
+#| label: fig-shap-beeswarm-noveg-2nd
+#| fig-cap: "SHAP beeswarm — Random Forest (non-vegas). Red = high feature value, blue = low."
+
+sorted_feats_nv2 = mean_shap_nv2.index.tolist()
+feat_idx_nv2     = {f: i for i, f in enumerate(FEATURES)}
+rng_bee2         = np.random.RandomState(0)
+
+fig = go.Figure()
+for yi, feat_name in enumerate(sorted_feats_nv2):
+    fi  = feat_idx_nv2[feat_name]
+    sv  = shap_vals_nv2[:, fi]
+    fv  = feat_vals_nv2[:, fi]
+    fv_min, fv_max = np.nanpercentile(fv, 5), np.nanpercentile(fv, 95)
+    fv_norm  = np.where(np.isnan(fv), 0.5,
+                   np.clip((fv - fv_min) / (fv_max - fv_min + 1e-9), 0, 1))
+    dot_colors = [norm_to_rgb_bee(v) for v in fv_norm]
+    y_jitter   = yi + rng_bee2.uniform(-0.35, 0.35, size=len(sv))
+
+    fig.add_trace(go.Scatter(
+        x=sv, y=y_jitter, mode="markers",
+        marker=dict(size=4, color=dot_colors, opacity=0.65, line=dict(width=0)),
+        name=feat_name, showlegend=False,
+        hovertemplate=(f"<b>{feat_name}</b><br>"
+                       "SHAP: %{x:.4f}<br>"
+                       f"Raw value: %{{customdata:.3f}}<extra></extra>"),
+        customdata=fv))
+
+fig.add_vline(x=0, line_color=BORDER, line_width=1.5)
+
+for val, label, xpos in [(0, "Low", 0.82), (1, "High", 0.97)]:
+    c = norm_to_rgb_bee(val)
+    fig.add_annotation(
+        x=xpos, y=1.01, xref="paper", yref="paper",
+        text=f"<b style='color:{c}'>{label}</b>",
+        showarrow=False, font=dict(size=11))
+fig.add_annotation(
+    x=0.895, y=1.01, xref="paper", yref="paper",
+    text="Feature value →", showarrow=False,
+    font=dict(size=10, color=SLATE))
+
+fig.update_layout(
+    xaxis=dict(title="SHAP value (impact on win probability)", zeroline=False),
+    yaxis=dict(
+        tickvals=list(range(len(sorted_feats_nv2))),
+        ticktext=sorted_feats_nv2,
+        tickfont=dict(size=10)),
+    height=720,
+    margin=dict(l=230, r=40, t=48, b=48),
+    paper_bgcolor="white", plot_bgcolor="white",
+    font=dict(family="Inter, system-ui, sans-serif", size=12, color="#1E293B"))
+fig.update_xaxes(showgrid=True, gridcolor=BORDER, zeroline=True,
+                 zerolinecolor=SLATE, zerolinewidth=1.5)
+fig.update_yaxes(showgrid=False)
+fig.show()
+```
+
+## 16c. Calibration — best non-vegas model
+
+A well-calibrated model should predict 60% win probability for games where the
+true win rate is 60%. Deviation from the diagonal indicates over- or
+under-confidence. Bubble size = number of games in each probability bin.
+
+```{python}
+#| label: fig-calibration
+#| fig-cap: "Calibration plot on 2025 holdout (W1-17). Bubble size = n games in bin. Non-vegas XGBoost."
+
+cal_bins = [0, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 1.0]
+test_data["pbin"] = pd.cut(test_data["model_prob"], bins=cal_bins)
+cal = (test_data.groupby("pbin", observed=True)
+                .agg(n=("win","count"), actual=("win","mean"),
+                     predicted=("model_prob","mean"))
+                .reset_index())
+
+fig = go.Figure()
+fig.add_trace(go.Scatter(x=[0,1], y=[0,1], mode="lines", name="Perfect calibration",
+    line=dict(color=SLATE, dash="dot", width=1.5), hoverinfo="skip"))
+fig.add_trace(go.Scatter(
+    x=cal["predicted"], y=cal["actual"], mode="markers+lines", name="Model",
+    marker=dict(size=(cal["n"]/5+6).tolist(), color=BLUE),
+    line=dict(color=BLUE, width=2),
+    text=cal["n"],
+    hovertemplate="Pred: %{x:.2f}<br>Actual: %{y:.2f}<br>n=%{text}<extra></extra>"))
+fig.update_layout(
+    xaxis=dict(title="Predicted win probability", range=[0, 1]),
+    yaxis=dict(title="Observed win rate", range=[0, 1]),
+    showlegend=True, legend=dict(x=0.02, y=0.98))
+clean_fig(fig, height=400).show()
+```
+
+## 16d. Weekly accuracy — non-vegas model vs Vegas
+
+Week 18 is shown as diamond markers (evaluated separately) so the bar chart
+covers only Weeks 1–17 where the "both teams trying" assumption holds.
+
+```{python}
+#| label: fig-weekly-acc
+#| fig-cap: "Week-by-week accuracy on 2025 holdout (W1-17 bars; W18 diamonds). Non-vegas model vs Vegas."
+
+test_data["model_correct"] = (test_data["model_pred"] == test_data["win"]).astype(int)
+test_data["vegas_correct"]  = ((test_data["spread_line_team"] > 0).astype(int) == test_data["win"]).astype(int)
+
+w18_data["model_correct"] = (w18_data["model_pred"] == w18_data["win"]).astype(int)
+w18_data["vegas_correct"]  = ((w18_data["spread_line_team"] > 0).astype(int) == w18_data["win"]).astype(int)
+
+# Use home-team rows only so bars are game-level (one prediction per game),
+# consistent with the table which reports game-level accuracy.
+test_home = test_data[test_data["is_home"] == 1].copy()
+weekly = (test_home.groupby("week")
+                   .agg(model_acc=("model_correct","mean"),
+                        vegas_acc=("vegas_correct","mean"),
+                        n=("win","count"))
+                   .reset_index())
+
+w18_home = w18_data[w18_data["is_home"] == 1]
+w18_model_acc = w18_home["model_correct"].mean()
+w18_vegas_acc = w18_home["vegas_correct"].mean()
+
+# Game-level W1-17 averages — match what the summary table reports
+model_acc_game = results_cls["Neural Network (MLP)"]["Test Acc (game)"]
+
+ORANGE = "#F97316"
+
+# Append week 18 as a regular bar row so it renders alongside W1-17
+weekly_all = pd.concat([
+    weekly,
+    pd.DataFrame([{"week": 18, "model_acc": w18_model_acc, "vegas_acc": w18_vegas_acc}])
+], ignore_index=True).sort_values("week")
+
+fig = go.Figure()
+fig.add_trace(go.Bar(x=weekly_all["week"], y=weekly_all["model_acc"],
+    name="Neural Net", marker_color=BLUE, opacity=0.85))
+fig.add_trace(go.Bar(x=weekly_all["week"], y=weekly_all["vegas_acc"],
+    name="Vegas", marker_color=ORANGE, opacity=0.85))
+
+fig.update_layout(
+    title=dict(text="MLP Neural Network vs Vegas Lines Week by Week",
+               font=dict(size=15), x=0.5, xanchor="center"),
+    barmode="group",
+    xaxis=dict(title="Week", dtick=1),
+    yaxis=dict(title="Accuracy", tickformat=".0%", range=[0, 1.1]))
+clean_fig(fig, height=440, margin=dict(l=48, r=24, t=48, b=80))
+fig.update_layout(
+    showlegend=True,
+    legend=dict(orientation="h", x=0.5, xanchor="center", y=-0.2,
+                font=dict(size=13), bgcolor="rgba(0,0,0,0)"))
+fig.show()
+```
+
+## 16e. Weekly projections table — all 32 teams
+
+```{python}
+#| label: tbl-weekly-projections
+#| code-summary: "Week-by-week projected win totals — all 32 teams (non-vegas model)"
+
+proj_pivot = (proj_noveg
+    .pivot(index="team", columns="proj_week", values="proj_total_wins")
+    .round(1))
+
+n_cols = len(proj_pivot.columns)
+proj_pivot.columns = ["Pre"] + [f"After Wk {w}" for w in range(1, n_cols)]
+
+proj_pivot["Actual"] = (
+    played_2025_noveg.groupby("team")["win"].sum().reindex(proj_pivot.index))
+
+proj_pivot = proj_pivot.sort_values("Pre", ascending=False)
+print("Non-Vegas Model — Week-by-week projected wins (all 32 teams)")
+print(proj_pivot.to_string())
+```
+
+```{python}
+#| label: tbl-weekly-projections-vegas
+#| code-summary: "Week-by-week projected win totals — all 32 teams (vegas model)"
+
+proj_pivot_v = (proj_veg
+    .pivot(index="team", columns="proj_week", values="proj_total_wins")
+    .round(1))
+
+n_cols_v = len(proj_pivot_v.columns)
+proj_pivot_v.columns = ["Pre"] + [f"After Wk {w}" for w in range(1, n_cols_v)]
+
+proj_pivot_v["Actual"] = (
+    played_2025_veg.groupby("team")["win"].sum().reindex(proj_pivot_v.index))
+
+proj_pivot_v = proj_pivot_v.sort_values("Pre", ascending=False)
+print("Vegas Model — Week-by-week projected wins (all 32 teams)")
+print(proj_pivot_v.to_string())
+```
+
+## 16f. Model accuracy ROC curves
+
+ROC curves show the tradeoff between true positive rate (correctly predicting
+wins) and false positive rate (incorrectly predicting wins) at every decision
+threshold. AUC (area under the curve) summarises overall discriminative power.
+Only classifiers with `predict_proba` are included; ridge and regressors are
+omitted as they don't produce calibrated probabilities.
+
+```{python}
+#| label: fig-roc-curves
+#| fig-cap: "ROC curves for probabilistic classifiers — non-vegas (solid) and vegas (dashed)."
+
+from sklearn.metrics import roc_curve
+
+fig = go.Figure()
+fig.add_trace(go.Scatter(x=[0,1], y=[0,1], mode="lines", name="Random (AUC=0.50)",
+    line=dict(color=SLATE, dash="dot", width=1.2), hoverinfo="skip"))
+
+roc_models = [
+    ("XGBoost",             xgb_cls,   X_test,    BLUE,   "solid"),
+    ("Random Forest",       rf_cls,    X_test,    TEAL,   "solid"),
+    ("Logistic Regression", lr_cls,    X_test_sc, AMBER,  "solid"),
+    ("XGBoost (vegas)",     xgb_cls_v, X_test_v,  BLUE,   "dash"),
+    ("Random Forest (veg)", rf_cls_v,  X_test_v,  TEAL,   "dash"),
+    ("Logistic Reg (veg)",  lr_cls_v,  X_test_sc_v, AMBER, "dash"),
+]
+
+for name, mdl, X_te, color, dash in roc_models:
+    prob = mdl.predict_proba(X_te)[:, 1]
+    fpr, tpr, _ = roc_curve(y_test_cls, prob)
+    auc_val = roc_auc_score(y_test_cls, prob)
+    fig.add_trace(go.Scatter(
+        x=fpr, y=tpr, mode="lines", name=f"{name} (AUC={auc_val:.3f})",
+        line=dict(color=color, width=2, dash=dash)))
+
+fig.update_layout(
+    xaxis=dict(title="False Positive Rate", range=[0, 1]),
+    yaxis=dict(title="True Positive Rate", range=[0, 1]),
+    showlegend=True,
+    legend=dict(x=0.36, y=0.08, bgcolor="rgba(255,255,255,0.9)",
+                font=dict(size=10)))
+clean_fig(fig, height=480).show()
+```
+
+---
+
+# Part VI — Results & Methodology Summary
+
+## 17. Full model comparison tables
+
+```{python}
+#| label: tbl-final-comparison
+#| code-summary: "Final comparison tables — classification and regression"
+
+print("=" * 80)
+print("TABLE 1 — WIN / LOSS CLASSIFICATION (direct binary prediction)")
+print("=" * 80)
+# ── Final comparison table uses game-level accuracy as primary metric ────────
+all_cls = {}
+for name, res in results_cls.items():
+    all_cls[name] = {
+        "Test Acc (game)": f"{res['Test Acc (game)']:.4f}",
+        "Test Acc (row)":  f"{res['Test Acc (row)']:.4f}",
+        "Train Acc": f"{res['Train Accuracy']:.4f}",
+        "Gap": f"{res['Train-Test Gap']:.4f}",
+        "AUC": str(res["AUC-ROC"]),
+        "Brier": str(res["Brier Score"]),
+        "vs Vegas": f"{res['Test Acc (game)'] - vegas_acc_game:+.4f}",
+        "Vegas feats": "No",
+        "Type": "Neural Network" if name == "Neural Network (MLP)" else
+                ("Non-linear" if name in ("XGBoost","Random Forest") else "Linear")
+    }
+for name, res in results_cls_v.items():
+    all_cls[name] = {
+        "Test Acc (game)": f"{res['Test Acc (game)']:.4f}",
+        "Test Acc (row)":  f"{res['Test Acc (row)']:.4f}",
+        "Train Acc": f"{res['Train Accuracy']:.4f}",
+        "Gap": f"{res['Train-Test Gap']:.4f}",
+        "AUC": str(res["AUC-ROC"]),
+        "Brier": str(res["Brier Score"]),
+        "vs Vegas": f"{res['Test Acc (game)'] - vegas_acc_game:+.4f}",
+        "Vegas feats": "Yes"
+    }
+all_cls["Vegas spread baseline"] = {
+    "Test Acc (game)": f"{vegas_acc_game:.4f}",
+    "Test Acc (row)": f"{vegas_acc_row:.4f}",
+    "Train Acc": "—", "Gap": "—", "AUC": "—",
+    "Brier": "—", "vs Vegas": "0.0000", "Vegas feats": "N/A"
+}
+print(pd.DataFrame(all_cls).T.to_string())
+
+print("\n")
+print("=" * 80)
+print("TABLE 2 — POINT DIFFERENTIAL REGRESSION → CONVERTED WIN/LOSS")
+print("(Primary metric: game-level accuracy)")
+print("=" * 80)
+all_reg = {}
+for name, res in results_reg.items():
+    all_reg[name] = {
+        "Test Acc (game)": f"{res['Test Acc (game)']:.4f}",
+        "Test Acc (row)":  f"{res['Test Acc (row)']:.4f}",
+        "Train Acc": f"{res['Train Accuracy (converted)']:.4f}",
+        "Gap": f"{res['Train-Test Gap']:.4f}",
+        "MAE (pts)": f"{res['Test MAE (pts)']:.3f}",
+        "RMSE (pts)": f"{res['Test RMSE (pts)']:.3f}",
+        "vs Vegas": f"{res['Test Acc (game)'] - vegas_acc_game:+.4f}",
+        "Vegas feats": "No"
+    }
+for name, res in results_reg_v.items():
+    all_reg[name] = {
+        "Test Acc (game)": f"{res['Test Acc (game)']:.4f}",
+        "Test Acc (row)":  f"{res['Test Acc (row)']:.4f}",
+        "Train Acc": f"{res['Train Accuracy (converted)']:.4f}",
+        "Gap": f"{res['Train-Test Gap']:.4f}",
+        "MAE (pts)": f"{res['Test MAE (pts)']:.3f}",
+        "RMSE (pts)": f"{res['Test RMSE (pts)']:.3f}",
+        "vs Vegas": f"{res['Test Acc (game)'] - vegas_acc_game:+.4f}",
+        "Vegas feats": "Yes"
+    }
+print(pd.DataFrame(all_reg).T.to_string())
+```
+
+## 18. Methodology summary
+
+| Component | Detail |
+|---|---|
+| **Data source** | Pro Football Reference via nflverse (2018–2025) |
+| **Training window** | 2018–2024, Weeks 1–17 only |
+| **Validation** | 2025 Weeks 1–17 + Week 18 separately |
+| **Non-vegas classifiers** | XGBoost, Random Forest, Logistic Regression, Ridge, Neural Network (MLP) |
+| **Non-vegas regressors** | XGBoost, Random Forest, OLS, Ridge (→ win/loss via >0) |
+| **Vegas classifiers** | Same four + `spread_line_team`, `total_line` |
+| **Vegas regressors** | Same four with vegas features |
+| **Features (base)** | 42 pre-game features across 7 groups |
+| **Features (vegas)** | 44 (base + spread_line_team + total_line) |
+| **Hyperparameter tuning** | Walk-forward CV (4 folds, seasons 2019–2022 val) for all 9 model types |
+| **MLP architecture** | Hidden layers tuned over (64,32), (128,64), (64,32,16); alpha ∈ {0.0001, 0.001, 0.01} |
+| **MLP SHAP method** | `KernelExplainer` if MLP wins (approximation); `TreeExplainer` if XGBoost/RF (exact); `LinearExplainer` if linear model |
+| **XGBoost early stopping** | OOT slice (2023–2024 W1-17); 2025 test never seen during training |
+| **Uncertainty quantification** | 5,000-simulation Monte Carlo on remaining schedule; 80% CI per team |
+| **Vegas accuracy W1-17 (2025)** | see output above |
+
+**Key limitations & next steps:**
+
+- Red zone efficiency stats unavailable at game level in PFR.
+- EPA per play is the gold-standard efficiency metric but not in PFR.
+- A Bayesian or Kalman filter ELO would produce honest uncertainty bands on ELO ratings themselves.
+- The clinch/elimination flags use a wins ≥ 10 / losses ≥ 10 proxy; exact playoff math is more complex.
+- Walk-forward CV covers only 4 folds (2019–2022); extending back further would require advanced stats prior to 2018 which PFR does not publish.
+
+## References
+
+- Pro Football Reference (pro-football-reference.com) — all model data.
+- nflverse project (nflverse.com) — data pipeline and hosting.
+- FiveThirtyEight NFL ELO methodology — season-carryover and regression approach.
+- Over The Cap (overthecap.com) — 2025 positional cap spending (supplementary only, Part VII).
+
+---
+
+# Part VII — Post-Model Supplementary: Cap Spending by Projected Win Quadrant
+
+::: {.callout-important}
+**Scope note — this section uses data outside the project brief.**  
+The model and all predictions in Parts I–VI use only Pro Football Reference data
+as required. This supplementary section brings in **Over The Cap (OTC)** 2025
+positional spending data purely as a descriptive, post-hoc analysis. It has
+**no influence on any model prediction**. Its purpose is to ask: *after the model
+has ranked teams by projected wins, what do the best-projected teams have in
+common in terms of roster construction?* This is the kind of question a front
+office would naturally want to explore once a team-quality ranking is in hand.
+:::
+
+::: {.callout-warning}
+**Quadrant boundary uncertainty.**  
+Quadrant assignments are based on point estimates of projected wins. Teams whose
+80% Monte Carlo CI spans a quadrant boundary (flagged below) may legitimately
+belong to either adjacent quadrant and should be interpreted with caution.
+:::
+
+## 19. Quadrant assignment & cap data
+
+```{python}
+#| label: cap-data
+#| code-summary: "Load OTC data; assign quadrants from best non-vegas model + flag boundary teams"
+
+otc_spending  = pd.read_csv(PATH_OTC_SPENDING)
+otc_contracts = pd.read_csv(PATH_OTC_CONTRACTS)
+
+POS_GROUPS = {
+    "QB":    ["QB"],
+    "RB":    ["RB", "FB"],
+    "OL":    ["OT", "OG", "C"],
+    "WR/TE": ["WR", "TE"],
+    "DL":    ["EDGE", "IDL"],
+    "LB":    ["LB"],
+    "CB":    ["CB"],
+    "S":     ["S"],
+}
+SPIDER_ORDER = ["QB", "WR/TE", "OL", "RB", "S", "CB", "LB", "DL"]
+
+QUAD_LABELS = ["Q1 (Top 8)", "Q2 (Upper-mid)", "Q3 (Lower-mid)", "Q4 (Bottom 8)"]
+Q_COLORS    = {
+    "Q1 (Top 8)":     "#0B162A",
+    "Q2 (Upper-mid)": "#2563EB",
+    "Q3 (Lower-mid)": "#D97706",
+    "Q4 (Bottom 8)":  "#DC2626",
+}
+Q_FILL = {
+    "Q1 (Top 8)":     "rgba(11,22,42,0.15)",
+    "Q2 (Upper-mid)": "rgba(37,99,235,0.15)",
+    "Q3 (Lower-mid)": "rgba(217,119,6,0.15)",
+    "Q4 (Bottom 8)":  "rgba(220,38,38,0.15)",
+}
+
+def assign_quadrants(proj_slice, ci_slice=None):
+    """
+    Assign win quadrants by projected win ranking.
+    ci_slice: optional DataFrame with ci_lo_80 / ci_hi_80 columns —
+              used to flag teams whose CI spans a quadrant boundary.
+    """
+    df = (proj_slice[["team", "proj_total_wins"]]
+          .sort_values("proj_total_wins", ascending=False)
+          .reset_index(drop=True))
+    df["rank"] = df.index + 1
+    df["quadrant"] = pd.cut(
+        df["rank"], bins=[0, 8, 16, 24, 32], labels=QUAD_LABELS)
+    ranges = {}
+    for q in QUAD_LABELS:
+        sub = df[df["quadrant"] == q]
+        ranges[q] = f"{sub['proj_total_wins'].min():.1f}–{sub['proj_total_wins'].max():.1f} proj W"
+    df["win_range"] = df["quadrant"].map(ranges)
+
+    if ci_slice is not None:
+        sorted_wins = df["proj_total_wins"].values  # descending
+        boundaries  = []
+        for cut in [8, 16, 24]:
+            if cut < len(sorted_wins):
+                boundaries.append((sorted_wins[cut - 1] + sorted_wins[cut]) / 2)
+        ci_df = ci_slice[["team", "ci_lo_80", "ci_hi_80"]].copy()
+        df    = df.merge(ci_df, on="team", how="left")
+        df["boundary_risk"] = df.apply(
+            lambda r: any(r["ci_lo_80"] < b < r["ci_hi_80"] for b in boundaries),
+            axis=1)
+        n_risky = df["boundary_risk"].sum()
+        if n_risky > 0:
+            print(f"⚠️  {n_risky} team(s) with 80% CI spanning a quadrant boundary: "
+                  f"{df[df['boundary_risk']]['team'].tolist()}")
+        else:
+            print("✅  No teams span a quadrant boundary.")
+    else:
+        df["boundary_risk"] = False
+
+    return df, ranges
+
+# Use the best non-vegas model projections as the single source of truth.
+# The cap analysis is descriptive; using one clean ranking avoids over-complication.
+pre_proj_nv = proj_noveg[proj_noveg["proj_week"] == 1]
+pre_assign,  pre_ranges  = assign_quadrants(pre_proj_nv, ci_slice=pre_proj_nv)
+w9_proj_nv  = proj_noveg[proj_noveg["proj_week"] == 9]
+w9_assign,   w9_ranges   = assign_quadrants(w9_proj_nv,  ci_slice=w9_proj_nv)
+
+def merge_spending(assign_df):
+    return otc_spending.merge(
+        assign_df[["team", "quadrant", "proj_total_wins", "boundary_risk"]],
+        on="team", how="left")
+
+pre_sp = merge_spending(pre_assign)
+w9_sp  = merge_spending(w9_assign)
+
+lg_avg = otc_spending.groupby("position")["cap_pct"].mean().to_dict()
+lg_grp_avg = {}
+for grp, positions in POS_GROUPS.items():
+    sub = otc_spending[otc_spending["position"].isin(positions)]
+    per_team = sub.groupby("team")["cap_pct"].sum()
+    lg_grp_avg[grp] = per_team.mean()
+
+def quad_pos_avg(spending_df, quad):
+    teams = spending_df[spending_df["quadrant"] == quad]["team"].unique()
+    sub   = spending_df[spending_df["team"].isin(teams)]
+    return sub.groupby("position")["cap_pct"].mean().to_dict()
+
+def quad_group_avg(spending_df, quad):
+    teams = spending_df[spending_df["quadrant"] == quad]["team"].unique()
+    sub   = spending_df[spending_df["team"].isin(teams)]
+    result = {}
+    for grp, positions in POS_GROUPS.items():
+        grp_sub  = sub[sub["position"].isin(positions)]
+        per_team = grp_sub.groupby("team")["cap_pct"].sum()
+        result[grp] = per_team.mean() if len(per_team) > 0 else 0.0
+    return result
+
+ALL_POS = ["QB","WR","OT","OG","C","RB","TE","FB",
+           "EDGE","IDL","LB","CB","S","K","P","LS"]
+
+print("\n=== PRESEASON QUADRANT ASSIGNMENTS (non-vegas model) ===")
+print(pre_assign[["team","proj_total_wins","quadrant","boundary_risk"]].to_string(index=False))
+```
+
+---
+
+## 20. Preseason quadrants — spending patterns
+
+### Ranked positional spending
+
+```{python}
+#| label: fig-cap-ranked-pre
+#| fig-cap: "Preseason projected win quadrants: positional cap % by group. Based on non-vegas model; OTC 2025 data."
+
+def make_ranked_bar(sp_df, ranges, title_suffix=""):
+    fig = make_subplots(
+        rows=2, cols=2,
+        subplot_titles=[f"{q}<br><sup>{ranges[q]}</sup>" for q in QUAD_LABELS],
+        vertical_spacing=0.14, horizontal_spacing=0.10)
+    for qi, q in enumerate(QUAD_LABELS):
+        row, col = (qi // 2) + 1, (qi % 2) + 1
+        pos_avg  = quad_pos_avg(sp_df, q)
+        pos_data = sorted([(p, pos_avg[p]) for p in ALL_POS if p in pos_avg],
+                          key=lambda x: x[1], reverse=True)
+        labels = [f"{p}" for p, _ in pos_data]
+        vals   = [v for _, v in pos_data]
+        fig.add_trace(go.Bar(
+            x=labels, y=vals, marker_color=Q_COLORS[q], marker_line_width=0,
+            text=[f"{v:.1f}%" for v in vals], textposition="outside",
+            textfont=dict(size=9), showlegend=False,
+            hovertemplate="%{x}<br>Cap: %{y:.2f}%<extra></extra>"),
+            row=row, col=col)
+        fig.update_yaxes(title_text="Cap %" if col == 1 else "",
+            ticksuffix="%", showgrid=True,
+            gridcolor="rgba(128,128,128,0.15)", row=row, col=col)
+        fig.update_xaxes(tickfont=dict(size=9), tickangle=-40,
+            showgrid=False, row=row, col=col)
+    fig.update_layout(height=640, margin=dict(l=48, r=24, t=72, b=48),
+        paper_bgcolor="white", plot_bgcolor="white",
+        font=dict(family="Inter, system-ui, sans-serif", size=12, color="#1E293B"))
+    return fig
+
+make_ranked_bar(pre_sp, pre_ranges).show()
+```
+
+### Delta from league average
+
+```{python}
+#| label: fig-cap-diverging-pre
+#| fig-cap: "Preseason quadrants: positional cap % delta vs league average. Green = above avg, red = below."
+
+_EXCL_POS = {"K", "P", "LS", "FB"}
+
+def make_diverging_bar(sp_df, ranges):
+    pos_by_lg = sorted(lg_avg.keys(), key=lambda p: lg_avg[p], reverse=True)
+
+    # Compute shared x-axis range across all quadrants
+    all_deltas = []
+    for q in QUAD_LABELS:
+        pos_avg = quad_pos_avg(sp_df, q)
+        for p in pos_by_lg:
+            if p in pos_avg and p not in _EXCL_POS:
+                all_deltas.append(pos_avg[p] - lg_avg[p])
+    x_pad   = max(abs(d) for d in all_deltas) * 1.3
+    x_range = [-x_pad, x_pad]
+
+    figs = []
+    for q in QUAD_LABELS:
+        pos_avg   = quad_pos_avg(sp_df, q)
+        positions = [p for p in pos_by_lg if p in pos_avg and p not in _EXCL_POS]
+        deltas    = [pos_avg[p] - lg_avg[p] for p in positions]
+        bar_colors = ["#0F6E56" if d >= 0 else "#DC2626" for d in deltas]
+        fig = go.Figure()
+        fig.add_trace(go.Bar(
+            x=deltas, y=positions, orientation="h",
+            marker_color=bar_colors, marker_line_width=0,
+            text=[f"{d:+.2f}%" for d in deltas],
+            textposition="outside", textfont=dict(size=9),
+            showlegend=False,
+            hovertemplate="%{y}<br>Delta: %{x:+.2f}%<extra></extra>"))
+        fig.add_vline(x=0, line_color="rgba(128,128,128,0.5)", line_width=1)
+        fig.update_xaxes(ticksuffix="%", showgrid=True,
+            gridcolor="rgba(128,128,128,0.15)",
+            title_text="Delta vs league avg", range=x_range)
+        fig.update_yaxes(tickfont=dict(size=9), showgrid=False)
+        fig.update_layout(
+            title=dict(text=f"{q}<br><sup>{ranges[q]}</sup>", font=dict(size=13)),
+            height=500, margin=dict(l=64, r=60, t=72, b=48),
+            paper_bgcolor="white", plot_bgcolor="white",
+            font=dict(family="Inter, system-ui, sans-serif", size=12, color="#1E293B"))
+        figs.append(fig)
+    return figs
+
+for fig in make_diverging_bar(pre_sp, pre_ranges):
+    fig.show()
+```
+
+### Spending profile radar
+
+```{python}
+#| label: fig-cap-spider-pre
+#| fig-cap: "Preseason quadrants: spending profile radar by positional group. Dotted line = league average."
+
+def make_spider(sp_df, ranges):
+    fig = make_subplots(rows=2, cols=2,
+        specs=[[{"type":"polar"},{"type":"polar"}],
+               [{"type":"polar"},{"type":"polar"}]],
+        subplot_titles=[f"{q}<br><sup>{ranges[q]}</sup>" for q in QUAD_LABELS],
+        vertical_spacing=0.12, horizontal_spacing=0.08)
+    for qi, q in enumerate(QUAD_LABELS):
+        row, col = (qi // 2) + 1, (qi % 2) + 1
+        grp_avg  = quad_group_avg(sp_df, q)
+        r_vals   = [grp_avg.get(g, 0) for g in SPIDER_ORDER]
+        r_closed = r_vals + [r_vals[0]]
+        t_closed = SPIDER_ORDER + [SPIDER_ORDER[0]]
+        fig.add_trace(go.Scatterpolar(
+            r=r_closed, theta=t_closed, fill="toself",
+            fillcolor=Q_FILL[q], line=dict(color=Q_COLORS[q], width=2),
+            name=q, showlegend=False,
+            hovertemplate="%{theta}: %{r:.1f}%<extra></extra>"),
+            row=row, col=col)
+        lg_r = [lg_grp_avg.get(g, 0) for g in SPIDER_ORDER]
+        fig.add_trace(go.Scatterpolar(
+            r=lg_r + [lg_r[0]], theta=t_closed, fill="none",
+            line=dict(color="rgba(128,128,128,0.5)", width=1, dash="dot"),
+            showlegend=False,
+            hovertemplate="Lg avg — %{theta}: %{r:.1f}%<extra></extra>"),
+            row=row, col=col)
+        polar_key = "polar" if qi == 0 else f"polar{qi+1}"
+        fig.update_layout(**{polar_key: dict(
+            radialaxis=dict(visible=True, range=[0, 30],
+                tickfont=dict(size=8), gridcolor="rgba(128,128,128,0.2)"),
+            angularaxis=dict(tickfont=dict(size=10),
+                gridcolor="rgba(128,128,128,0.2)"),
+            bgcolor="white")})
+    fig.update_layout(height=640, margin=dict(l=40, r=40, t=80, b=40),
+        paper_bgcolor="white",
+        font=dict(family="Inter, system-ui, sans-serif", size=12, color="#1E293B"))
+    return fig
+
+make_spider(pre_sp, pre_ranges).show()
+```
+
+---
+
+## 21. Week 9 quadrants — spending patterns
+
+### Ranked positional spending
+
+```{python}
+#| label: fig-cap-ranked-w9
+#| fig-cap: "Week 9 projected win quadrants: positional cap %."
+make_ranked_bar(w9_sp, w9_ranges).show()
+```
+
+### Delta from league average
+
+```{python}
+#| label: fig-cap-diverging-w9
+#| fig-cap: "Week 9 quadrants: positional cap % delta vs league average."
+for fig in make_diverging_bar(w9_sp, w9_ranges):
+    fig.show()
+```
+
+### Spending profile radar
+
+```{python}
+#| label: fig-cap-spider-w9
+#| fig-cap: "Week 9 quadrants: spending profile radar."
+make_spider(w9_sp, w9_ranges).show()
+```
+
+::: {.callout-note}
+**How to read these charts in context.**  
+The quadrants are derived entirely from PFR-based model projections — the cap
+data is overlaid purely for descriptive insight. Q1 teams (top 8 projected wins)
+represent what winning roster construction looks like *according to 2025 OTC
+spending*; Q4 teams show what underperforming investment looks like. Teams that
+shift quadrant from preseason to Week 9 are ones the model revised significantly
+once real results came in — early-season outliers worth examining closely.
+
+Note that correlation here is not causation: a team in Q1 that over-invests in
+QB is not necessarily winning *because* of that investment. The charts are
+descriptive tools for pattern recognition, not prescriptive allocation formulas.
+:::
